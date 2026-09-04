@@ -11,7 +11,8 @@ import hashlib
 import html
 import io
 import re
-from dataclasses import dataclass, field
+import time
+from dataclasses import asdict, dataclass, field
 from difflib import SequenceMatcher
 from typing import Any
 
@@ -19,12 +20,13 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 import yahoo_auth
-from draft_utils import draft_timing, next_user_pick, snake_picks
+from draft_parser import match_player, parse_pasted_picks
+from draft_utils import (DEFAULT_LEAGUE_SETTINGS, current_overall_pick, draft_timing,
+                         export_state, identify_ownership, next_user_pick, pick_context,
+                         record_pick, restore_state, snake_picks)
 from recommendation_engine import rank_recommendations
 
 
-TEAMS = 10
-MY_SLOT = 3
 POSITIONS = ("ALL", "RB", "WR", "QB", "TE")
 PLAYER_POSITIONS = set(POSITIONS[1:])
 
@@ -156,10 +158,9 @@ def parse_rankings_csv(content: str) -> list[Player]:
 
 
 def initial_draft(players: list[Player]) -> list[dict[str, Any]]:
-    return [
-        {"player": player, "pick": pick, "mine": False}
-        for pick, player in enumerate((p for p in players if p.drafted), start=1)
-    ]
+    return [{"player_id": player.id, "player": player, "pick": pick, "mine": False,
+             "batch_id": "csv", "source": "csv"}
+            for pick, player in enumerate((p for p in players if p.drafted), start=1)]
 
 
 def initialize_state() -> None:
@@ -168,17 +169,18 @@ def initialize_state() -> None:
         st.session_state.players = players
         st.session_state.draft_log = initial_draft(players)
         st.session_state.upload_token = None
+        st.session_state.league_settings = dict(DEFAULT_LEAGUE_SETTINGS)
+        st.session_state.manual_labels = {}
 
 
-def draft_player(player_id: str, mine: bool) -> None:
-    drafted_ids = {entry["player"].id for entry in st.session_state.draft_log}
-    player = next((p for p in st.session_state.players if p.id == player_id), None)
-    if player and player.id not in drafted_ids:
-        st.session_state.draft_log.append({
-            "player": player,
-            "pick": len(st.session_state.draft_log) + 1,
-            "mine": mine,
-        })
+def draft_player(player_id: str, mine: bool, pick: int | None = None,
+                 batch_id: str | None = None, source: str = "manual") -> bool:
+    added = record_pick(st.session_state.draft_log, player_id, pick=pick, mine=mine,
+                        batch_id=batch_id, source=source)
+    if added:
+        next(entry for entry in st.session_state.draft_log
+             if entry["player_id"] == player_id)["player"] = _player_map()[player_id]
+    return added
 
 
 def undo_last() -> None:
@@ -212,22 +214,8 @@ def player_search_score(player: Player, query: str) -> tuple[int, float, float]:
 
 def match_pasted_name(name: str, available: list[Player]) -> tuple[Player | None, str]:
     """Conservatively fuzzy-match one pasted Yahoo name."""
-    query = name.strip()
-    if not query:
-        return None, "unmatched"
-    scored = sorted(((player_search_score(p, query), p) for p in available),
-                    key=lambda item: item[0], reverse=True)
-    if not scored:
-        return None, "unmatched"
-    best_score, best = scored[0]
-    # Exact/partial matches are safe; fuzzy matches require a strong, clear lead.
-    if best_score[0] >= 80:
-        same_quality = [p for score, p in scored if score[:2] == best_score[:2]]
-        return (best, "confirmed") if len(same_quality) == 1 else (None, "ambiguous")
-    second_similarity = scored[1][0][1] if len(scored) > 1 else 0
-    if best_score[1] >= .82 and best_score[1] - second_similarity >= .12:
-        return best, "confirmed"
-    return None, "ambiguous" if best_score[1] >= .6 else "unmatched"
+    player, _, status = match_player(name, available)
+    return player, "confirmed" if status == "Ready" else "ambiguous" if "Ambiguous" in status else "unmatched"
 
 
 def _keyboard_listener(focus_search: bool = False) -> None:
@@ -301,7 +289,7 @@ def render_yahoo_auth() -> None:
     try:
         credentials = yahoo_auth.credentials_from_secrets(st.secrets)
     except yahoo_auth.YahooAuthError:
-        st.write("Yahoo not connected")
+        st.write("⚪ Yahoo Not Connected")
         st.caption("Configure Yahoo OAuth credentials in Streamlit Secrets to connect.")
         return
 
@@ -348,219 +336,201 @@ def render_yahoo_auth() -> None:
             st.error(str(exc))
 
     if "yahoo_token" in st.session_state:
-        st.write("🟢 Yahoo Connected")
         if st.session_state.get("yahoo_verified"):
-            st.success("Yahoo Fantasy connection verified.")
+            st.success("🟢 Yahoo Fantasy Connected")
+        else:
+            st.warning("🟡 Yahoo Login Connected — Fantasy API access pending/unavailable")
         if st.button("Disconnect Yahoo"):
             for key in ("yahoo_token", "yahoo_verified"):
                 st.session_state.pop(key, None)
             st.rerun()
     else:
-        st.write("Yahoo not connected")
+        st.write("⚪ Yahoo Not Connected")
         st.link_button(
             "Connect Yahoo",
             yahoo_auth.authorization_url(credentials, yahoo_auth.new_signed_state(credentials)),
         )
 
 
+def _player_map() -> dict[str, Player]:
+    return {player.id: player for player in st.session_state.players}
+
+
+def _reset_quick_search() -> None:
+    st.session_state.quick_version = st.session_state.get("quick_version", 0) + 1
+    st.session_state.quick_refocus = True
+
+
+def _state_json() -> str:
+    portable_log = [{key: value for key, value in entry.items() if key != "player"}
+                    for entry in st.session_state.draft_log]
+    return export_state(st.session_state.league_settings,
+                        [asdict(player) for player in st.session_state.players],
+                        portable_log, st.session_state.manual_labels)
+
+
+def _restore_uploaded_state(raw: bytes) -> None:
+    payload = restore_state(raw.decode("utf-8"))
+    defaults = dict(DEFAULT_LEAGUE_SETTINGS); defaults.update(payload["league_settings"])
+    defaults["teams"] = int(defaults["teams"]); defaults["draft_slot"] = int(defaults["draft_slot"])
+    if not 1 <= defaults["draft_slot"] <= defaults["teams"]:
+        raise ValueError("My Draft Slot must be within the league size")
+    st.session_state.players = [Player(**row) for row in payload["players"]]
+    by_id = {player.id: player for player in st.session_state.players}
+    st.session_state.draft_log = [{**entry, "player": by_id[entry["player_id"]]}
+                                  for entry in payload["draft_log"]]
+    st.session_state.league_settings = defaults
+    st.session_state.manual_labels = payload.get("manual_labels", {})
+    st.session_state.upload_token = None
+
+
 def main() -> None:
     st.set_page_config(page_title="Fantasy Draft Assistant", page_icon="🏈", layout="wide")
-    _inject_styles()
-    initialize_state()
-
-    st.markdown('<div class="hero"><span class="eyebrow">2026 · STANDARD · 10 TEAMS</span>'
-                '<h1>Fantasy Draft Assistant</h1><span>Manual draft board · Team 3</span></div>',
+    _inject_styles(); initialize_state()
+    settings = st.session_state.league_settings
+    st.markdown(f'<div class="hero"><span class="eyebrow">{settings["season"]} · {html.escape(settings["scoring"])} · {settings["teams"]} TEAMS</span>'
+                '<h1>Fantasy Draft Assistant</h1>'
+                f'<span>{html.escape(settings["league_name"])} · {html.escape(settings["my_team_name"])}</span></div>',
                 unsafe_allow_html=True)
 
-    render_yahoo_auth()
-    st.divider()
+    current_pick = current_overall_pick(st.session_state.draft_log)
+    teams, slot = int(settings["teams"]), int(settings["draft_slot"])
+    round_number, drafting_slot = pick_context(current_pick, teams)
+    future_picks = [p for p in snake_picks(teams, slot, 30) if p >= current_pick]
+    next_pick = next_user_pick(current_pick, teams, slot, 30)
+    on_clock = current_pick == next_pick
 
-    uploaded = st.file_uploader("Import rankings CSV", type=["csv"],
-                                help="Importing replaces the board and resets draft progress.")
-    if uploaded is not None:
-        content = uploaded.getvalue()
-        token = hashlib.sha256(content).hexdigest()
-        if token != st.session_state.upload_token:
-            players = parse_rankings_csv(content.decode("utf-8-sig", errors="replace"))
-            if players:
-                st.session_state.players = players
-                st.session_state.draft_log = initial_draft(players)
-                st.session_state.upload_token = token
-                st.success(f"Imported {len(players)} players from {uploaded.name}.")
-            else:
-                st.error("No valid players found. Include Player and Position (RB, WR, QB, or TE).")
+    st.header("LIVE DRAFT CONTROL")
+    if on_clock:
+        st.error("🏈 ON THE CLOCK — MAKE YOUR PICK")
+    elif next_pick and next_pick - current_pick <= 3:
+        st.warning(f"Your turn is approaching — {next_pick - current_pick} pick(s) away")
+    metrics = st.columns([1, 1, 1, 1, 2])
+    metrics[0].metric("OVERALL PICK", current_pick)
+    metrics[1].metric("ROUND", round_number)
+    metrics[2].metric("DRAFTING SLOT", drafting_slot)
+    metrics[3].metric("UNTIL MY PICK", max(0, next_pick-current_pick) if next_pick else "—")
+    metrics[4].metric("MY NEXT PICKS", " · ".join(map(str, future_picks[:5])) or "Complete")
 
-    current_pick = len(st.session_state.draft_log) + 1
-    future_picks = [pick for pick in snake_picks() if pick >= current_pick]
-    next_pick = next_user_pick(current_pick)
-    metrics = st.columns([1, 1, 1, 2])
-    metrics[0].metric("CURRENT OVERALL PICK", current_pick)
-    metrics[1].metric("PICKS UNTIL YOUR TURN", max(0, next_pick - current_pick) if next_pick else "—")
-    metrics[2].metric("YOUR NEXT PICK", next_pick or "—")
-    metrics[3].metric("YOUR PICK PATH", " · ".join(map(str, future_picks[:5])) or "Draft complete")
-
-    drafted_ids = {entry["player"].id for entry in st.session_state.draft_log}
-    roster = [entry["player"] for entry in st.session_state.draft_log if entry["mine"]]
+    players_by_id = _player_map()
+    drafted_ids = {entry["player_id"] for entry in st.session_state.draft_log}
+    roster = [players_by_id[e["player_id"]] for e in st.session_state.draft_log if e["mine"]]
     available = [p for p in st.session_state.players if p.id not in drafted_ids]
 
     st.subheader("Quick Draft Entry")
-    st.caption("Type a player, last name, NFL team, or Draft Key. Enter selects; then D drafts or M adds to your roster.")
+    st.caption("Search by name, NFL team, or Draft Key. Enter selects; D drafts, M marks mine, U undoes.")
     quick_version = st.session_state.get("quick_version", 0)
-    selected_id = st.selectbox(
-        "Quick Draft Search",
-        options=[p.id for p in available],
-        index=None,
-        key=f"quick_search_{quick_version}",
-        placeholder="Search available players…  ( / or Ctrl+K )",
-        format_func=lambda player_id: next(
-            f"{p.player} — {p.position} · {p.team} · {p.draft_key}"
-            for p in available if p.id == player_id
-        ),
-    )
-    selected = next((p for p in available if p.id == selected_id), None)
-    quick_drafted, quick_mine = st.columns(2)
-    if quick_drafted.button("Draft selected", disabled=selected is None,
-                            use_container_width=True, key="quick_drafted"):
-        draft_player(selected.id, False)
-        st.session_state.quick_version = quick_version + 1
-        st.session_state.quick_refocus = True
-        st.rerun()
-    if quick_mine.button("Mine selected", disabled=selected is None, type="primary",
-                         use_container_width=True, key="quick_mine"):
-        draft_player(selected.id, True)
-        st.session_state.quick_version = quick_version + 1
-        st.session_state.quick_refocus = True
-        st.rerun()
+    selected_id = st.selectbox("Quick Draft Search", [p.id for p in available], index=None,
+        key=f"quick_search_{quick_version}", placeholder="Search available players…  ( / or Ctrl+K )",
+        format_func=lambda pid: f"{players_by_id[pid].player} — {players_by_id[pid].position} · {players_by_id[pid].team} · {players_by_id[pid].draft_key}")
+    selected = players_by_id.get(selected_id)
+    a, b, c = st.columns([1, 1, 1])
+    if a.button("Draft selected", disabled=not selected, use_container_width=True, key="quick_drafted"):
+        draft_player(selected.id, False); _reset_quick_search(); st.rerun()
+    if b.button("Mine selected", disabled=not selected, type="primary", use_container_width=True, key="quick_mine"):
+        draft_player(selected.id, True); _reset_quick_search(); st.rerun()
+    if c.button("↶ Undo", disabled=not st.session_state.draft_log, use_container_width=True, key="quick_undo"):
+        undo_last(); _reset_quick_search(); st.rerun()
     _keyboard_listener(st.session_state.pop("quick_refocus", False))
 
-    with st.expander("Paste Draft Picks"):
-        pasted = st.text_area("Yahoo player names", key="pasted_names",
-                              placeholder="Paste one player per line")
-        pasted_names = [line.strip() for line in pasted.splitlines() if line.strip()]
-        paste_matches = [(name, *match_pasted_name(name, available)) for name in pasted_names]
-        confirmed = [(name, player) for name, player, status in paste_matches
-                     if status == "confirmed" and player is not None]
-        for name, player, status in paste_matches:
-            if status == "confirmed":
-                st.success(f"{name} → {player.player} ({player.position}, {player.team})")
-            elif status == "ambiguous":
-                st.warning(f"{name} — ambiguous; not selected")
-            else:
-                st.error(f"{name} — no available match")
-        if st.button(f"Mark {len(confirmed)} confirmed drafted", disabled=not confirmed,
-                     key="confirm_pasted"):
-            for _, player in confirmed:
-                draft_player(player.id, False)
-            st.session_state.pasted_names = ""
-            st.session_state.quick_version = quick_version + 1
-            st.session_state.quick_refocus = True
-            st.rerun()
+    recommendation_title = "🔥 Top 5 Recommendations — YOUR PICK IS CLOSE" if next_pick and next_pick-current_pick <= 3 else "Top 5 Recommendations"
+    st.subheader(recommendation_title)
+    recommendations = rank_recommendations(st.session_state.players, drafted_ids, roster, current_pick)[:5]
+    if not recommendations: st.info("No available players to recommend.")
+    for recommendation_rank, (player, result) in enumerate(recommendations, 1):
+        action, likely_return, survival = draft_timing(current_pick=current_pick, next_pick=next_pick,
+            adp=player.adp, rank=result.weighted_rank or player.ecr or player.rank,
+            position=player.position, model_label=result.model_label)
+        manual = next((label for enabled, label in ((player.target, "Target"),
+                       (player.sleeper, "Sleeper"), (player.fade, "Fade")) if enabled), None)
+        labels = f"Model: {result.model_label}" + (f" · Manual: {manual}" if manual else "")
+        basis = result.weighted_rank or player.ecr or player.rank
+        value = player.adp-basis if player.adp and basis else None
+        st.markdown(f'<div class="player-card"><strong>{recommendation_rank}. {html.escape(player.player)} — {player.position} · {html.escape(player.team)} — {result.final_score}/100</strong><br>'
+                    f'<span class="tag {result.model_label.casefold()}">{html.escape(labels)}</span> <span class="tag">{action}</span><br>'
+                    f'<span class="muted">ADP {_format_number(player.adp)} · ECR {_format_number(player.ecr)} · '
+                    f'{f"{value:+.0f} value vs ADP" if value is not None else "Value unavailable"} · {survival}</span><br>'
+                    f'<span class="muted">{html.escape(result.explanation)}</span></div>', unsafe_allow_html=True)
 
-    board, sidebar = st.columns([2.25, 1], gap="large")
-    with board:
-        st.subheader("Top 5 Recommendations")
-        recommendations = rank_recommendations(
-            st.session_state.players, drafted_ids, roster, current_pick
-        )[:5]
-        if not recommendations:
-            st.info("No available players to recommend.")
-        for recommendation_rank, (player, result) in enumerate(recommendations, 1):
-            action, likely_return, survival = draft_timing(
-                current_pick=current_pick, next_pick=next_pick, adp=player.adp,
-                rank=player.rank, position=player.position, model_label=result.model_label,
-            )
-            manual = next((label for enabled, label in (
-                (player.target, "Target"), (player.sleeper, "Sleeper"), (player.fade, "Fade")
-            ) if enabled), None)
-            labels = f"Model: {result.model_label}"
-            if manual:
-                labels += f" · Manual: {manual}"
-            value_basis = result.weighted_rank or player.ecr or player.rank
-            value = (player.adp - value_basis) if player.adp and value_basis else None
-            value_text = f"{value:+.0f} value vs ADP" if value is not None else "Value unavailable"
-            safe = html.escape(player.player)
-            explanation = result.explanation
-            if likely_return:
-                explanation += " Strong value may still remain at the next selection."
-            st.markdown(
-                f'<div class="player-card"><strong>{recommendation_rank}. {safe} — '
-                f'{player.position} · {html.escape(player.team)} — {result.final_score}/100</strong><br>'
-                f'<span class="tag {result.model_label.casefold()}">{html.escape(labels)}</span> '
-                f'<span class="tag">{action}</span><br><span class="muted">ADP '
-                f'{_format_number(player.adp)} · ECR {_format_number(player.ecr)} · {value_text} · '
-                f'{survival}</span><br><span class="muted">{html.escape(explanation)}</span></div>',
-                unsafe_allow_html=True,
-            )
-            with st.expander(f"Why {player.player}?", expanded=False):
-                st.write({"Expert Score": round(result.expert_score),
-                          "Consensus Score": round(result.consensus_score),
-                          "ADP Value Score": round(result.adp_value_score),
-                          "Situation Score": round(result.situation_score),
-                          "Roster Fit Score": round(result.roster_fit_score)})
-
-        st.subheader("Best available")
-        filters, search = st.columns([1.2, 2])
-        position = filters.segmented_control("Position", POSITIONS, default="ALL", key="position_filter")
-        query = search.text_input("Player search", placeholder="Search player or team").strip().casefold()
-        shown = [p for p in available if (position == "ALL" or p.position == position)
-                 and (not query or query in f"{p.player} {p.team}".casefold())]
+    left, right = st.columns([1.65, 1], gap="large")
+    with left:
+        st.subheader("Best Available")
+        filter_col, search_col = st.columns([1, 2])
+        position = filter_col.segmented_control("Position", POSITIONS, default="ALL", key="position_filter")
+        query = search_col.text_input("Player search", placeholder="Search player or team").casefold().strip()
+        shown = [p for p in available if (position == "ALL" or p.position == position) and
+                 (not query or query in f"{p.player} {p.team} {p.draft_key}".casefold())]
         st.caption(f"{len(available)} available")
-        if not shown:
-            st.info("No available players match these filters.")
         for player in shown:
-            info, drafted_col, mine_col = st.columns([6, 1.35, 1.25], vertical_alignment="center")
-            badges = "".join(
-                f'<span class="tag {css}">{label}</span>'
-                for enabled, label, css in ((player.target, "Target", "target"),
-                                             (player.sleeper, "Sleeper", "sleeper"),
-                                             (player.fade, "Fade", "fade")) if enabled
-            ) or '<span class="tag">Neutral</span>'
-            safe_name = html.escape(player.player)
-            safe_team = html.escape(player.team)
-            info.markdown(
-                f'<div class="player-card"><strong>#{_format_number(player.rank)} &nbsp; '
-                f'{safe_name}</strong><br><span class="muted">{player.position} · {safe_team} '
-                f'&nbsp; ADP {_format_number(player.adp)} · ECR {_format_number(player.ecr)}</span><br>{badges}</div>',
-                unsafe_allow_html=True,
-            )
-            if drafted_col.button("Drafted", key=f"draft_{player.id}", use_container_width=True):
-                draft_player(player.id, False)
-                st.rerun()
-            if mine_col.button("+ Mine", key=f"mine_{player.id}", type="primary", use_container_width=True):
-                draft_player(player.id, True)
-                st.rerun()
+            info, dc, mc = st.columns([6, 1.35, 1.25], vertical_alignment="center")
+            info.markdown(f"**#{_format_number(player.rank)}  {html.escape(player.player)}**  \n{player.position} · {html.escape(player.team)} · ADP {_format_number(player.adp)} · ECR {_format_number(player.ecr)}", unsafe_allow_html=True)
+            if dc.button("Drafted", key=f"draft_{player.id}", use_container_width=True): draft_player(player.id, False); st.rerun()
+            if mc.button("+ Mine", key=f"mine_{player.id}", type="primary", use_container_width=True): draft_player(player.id, True); st.rerun()
+    with right:
+        st.subheader(f"My Roster ({len(roster)})")
+        for entry in sorted((e for e in st.session_state.draft_log if e["mine"]), key=lambda e:e["pick"]):
+            p=players_by_id[entry["player_id"]]; st.markdown(f"**{p.position} · {html.escape(p.player)}**  \n{p.team} · Pick {entry['pick']}")
+        if not roster: st.caption("Use + Mine or Mine selected for your confirmed selections.")
+        st.subheader("Recent Picks")
+        for entry in sorted(st.session_state.draft_log, key=lambda e:e["pick"], reverse=True)[:10]:
+            p=players_by_id[entry["player_id"]]; mine=" · **YOUR PICK**" if entry["mine"] else ""
+            st.markdown(f"**{entry['pick']}. {html.escape(p.player)}** — {p.position} · {p.team}{mine}")
 
-    with sidebar:
-        roster_entries = [entry for entry in st.session_state.draft_log if entry["mine"]]
-        st.subheader(f"My roster ({len(roster_entries)})")
-        if roster_entries:
-            for entry in roster_entries:
-                player = entry["player"]
-                st.markdown(f"**{player.position} · {html.escape(player.player)}**  \n"
-                            f"<span class='muted'>{html.escape(player.team)} · Pick {entry['pick']}</span>",
-                            unsafe_allow_html=True)
-        else:
-            st.caption('Use “+ Mine” when you make a pick.')
+    with st.expander("Paste Draft Picks / Catch Up"):
+        starting = st.number_input("Starting Pick Number", min_value=1, value=current_pick, step=1)
+        pasted = st.text_area("Draft-board text", key="pasted_names", placeholder="18. A.J. Brown\nPick 19 - Chase Brown")
+        preview=[]; seen=set()
+        for parsed in parse_pasted_picks(pasted, int(starting)):
+            player, confidence, status = match_player(parsed["raw_name"], available)
+            ownership, signals = identify_ownership(pick=parsed["pick"], fantasy_team=parsed["fantasy_team"],
+                yahoo_team_id=parsed["yahoo_team_id"], settings=settings)
+            if player and (player.id in seen or player.id in drafted_ids): status="Duplicate/already drafted"
+            if ownership == "REVIEW": status="Ownership conflict — REVIEW"
+            if player: seen.add(player.id)
+            preview.append({**parsed, "player_obj":player, "Player":player.player if player else parsed["raw_name"],
+                "Pos":player.position if player else parsed["position"], "NFL Team":player.team if player else parsed["team"],
+                "Fantasy Team":parsed["fantasy_team"], "Ownership":ownership, "Confidence":confidence, "Status":status})
+        if preview:
+            st.dataframe([{k:r[k] for k in ("pick","Player","Pos","NFL Team","Fantasy Team","Ownership","Confidence","Status")} for r in preview], hide_index=True, use_container_width=True)
+        valid=[r for r in preview if r["player_obj"] and r["Status"] == "Ready" and r["Ownership"] != "REVIEW"]
+        if st.button("Confirm Draft Picks", disabled=not valid, key="confirm_pasted"):
+            batch=f"paste-{time.time_ns()}"
+            for row in sorted(valid,key=lambda r:r["pick"]):
+                draft_player(row["player_obj"].id, row["Ownership"] == "YOUR PICK", row["pick"], batch, "paste")
+            st.session_state.pasted_names=""; _reset_quick_search(); st.rerun()
+        if st.button("Undo Last Batch", disabled=not any(str(e.get("batch_id") or "").startswith("paste-") for e in st.session_state.draft_log)):
+            batches=[e.get("batch_id") for e in st.session_state.draft_log if str(e.get("batch_id","")).startswith("paste-")]
+            latest=batches[-1]; st.session_state.draft_log=[e for e in st.session_state.draft_log if e.get("batch_id") != latest]; st.rerun()
 
-        st.divider()
-        log_title, undo_col = st.columns([2, 1])
-        log_title.subheader("Draft log")
-        if undo_col.button("↶ Undo", disabled=not st.session_state.draft_log,
-                           help="Undo the last draft action", use_container_width=True):
-            undo_last()
-            st.rerun()
-        if st.session_state.draft_log:
-            for entry in reversed(st.session_state.draft_log):
-                player = entry["player"]
-                mine = " · YOUR PICK" if entry["mine"] else ""
-                st.markdown(f"**{entry['pick']}. {html.escape(player.player)}**  \n"
-                            f"<span class='muted'>{player.position} · {html.escape(player.team)}{mine}</span>",
-                            unsafe_allow_html=True)
-        else:
-            st.caption("No picks recorded yet.")
-        if st.button("Reset draft", disabled=not st.session_state.draft_log):
-            st.session_state.draft_log = []
-            st.rerun()
+    with st.expander("League & My Team"):
+        c1,c2=st.columns(2)
+        settings["season"]=c1.number_input("Season", min_value=2026, value=int(settings["season"]))
+        settings["league_name"]=c1.text_input("League Name", settings["league_name"])
+        settings["my_team_name"]=c1.text_input("My Team Name", settings["my_team_name"])
+        settings["yahoo_league_id"]=c1.text_input("Yahoo League ID", settings["yahoo_league_id"])
+        settings["yahoo_team_id"]=c2.text_input("Yahoo Team ID", settings["yahoo_team_id"])
+        settings["teams"]=c2.number_input("Number of Teams", min_value=2, max_value=32, value=int(settings["teams"]))
+        settings["draft_slot"]=c2.number_input("My Draft Slot", min_value=1, max_value=int(settings["teams"]), value=min(int(settings["draft_slot"]),int(settings["teams"])))
+        settings["draft_type"]=c2.selectbox("Draft Type", ["Snake"], index=0)
+        settings["scoring"]=c2.selectbox("Scoring Format", ["Standard / Non-PPR","Half PPR","PPR"], index=["Standard / Non-PPR","Half PPR","PPR"].index(settings["scoring"]) if settings["scoring"] in ["Standard / Non-PPR","Half PPR","PPR"] else 0)
+        settings["qb_format"]=c2.selectbox("QB Format", ["1 QB","Superflex"], index=0 if settings["qb_format"]=="1 QB" else 1)
+
+    with st.expander("Data, Backup & Yahoo"):
+        uploaded=st.file_uploader("Import rankings CSV", type=["csv"], help="Replaces player pool and resets progress.")
+        if uploaded is not None:
+            raw=uploaded.getvalue(); token=hashlib.sha256(raw).hexdigest()
+            if token != st.session_state.upload_token:
+                imported=parse_rankings_csv(raw.decode("utf-8-sig",errors="replace"))
+                if imported: st.session_state.players=imported; st.session_state.draft_log=initial_draft(imported); st.session_state.upload_token=token; st.success(f"Imported {len(imported)} players."); st.rerun()
+                else: st.error("No valid players. Player and Position are required.")
+        st.download_button("Export Draft State", _state_json(), file_name="fantasy-draft-state.json", mime="application/json")
+        restored=st.file_uploader("Restore Draft State", type=["json"], key="restore_state")
+        if restored and st.button("Restore uploaded state"):
+            try: _restore_uploaded_state(restored.getvalue())
+            except (ValueError, TypeError, UnicodeDecodeError) as exc: st.error(f"Restore failed: {exc}")
+            else: st.success("Draft state restored."); st.rerun()
+        if st.button("Reset draft", disabled=not st.session_state.draft_log): st.session_state.draft_log=[]; st.rerun()
+        render_yahoo_auth()
 
 
 if __name__ == "__main__":
