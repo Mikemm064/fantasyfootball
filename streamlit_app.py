@@ -74,6 +74,144 @@ class Player:
     expert_rankings: dict[str, float] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class YahooPick:
+    """One completed selection extracted from a Yahoo draft-board paste."""
+
+    name: str
+    position: str
+    team: str
+    round: int
+    draft_slot: int
+    overall_pick: int
+    explicit_user_pick: bool = False
+    yahoo_team_id: str | None = None
+
+
+@dataclass(frozen=True)
+class YahooBoard:
+    """Ephemeral metadata and selections from a single clipboard snapshot."""
+
+    team_count: int | None
+    managers: dict[int, str]
+    detected_user_slot: int | None
+    picks: tuple[YahooPick, ...]
+    current_round: int | None = None
+    current_slot: int | None = None
+    current_overall_pick: int | None = None
+
+    @property
+    def current_manager(self) -> str | None:
+        return self.managers.get(self.current_slot) if self.current_slot else None
+
+
+_PICK_SLOT = re.compile(r"^(\d+)\.(\d+)$")
+_URL = re.compile(r"(?:https?://|data:image/)[^\s)>]+", re.I)
+_NOISE = {"svg", "image", "img", "...", "…", "draft board", "yahoo draft board"}
+
+
+def _clean_yahoo_lines(content: str) -> list[str]:
+    """Remove image links/Markdown decoration without damaging player apostrophes."""
+    content = re.sub(r"!\[[^]]*]\([^)]*\)", "\n", content)
+    content = re.sub(r"\[([^]]+)]\([^)]*\)", r"\1", content)
+    content = re.sub(r"<img\b[^>]*>", "\n", content, flags=re.I)
+    lines: list[str] = []
+    for raw in content.splitlines():
+        line = _URL.sub("", raw).strip()
+        line = re.sub(r"^\s{0,3}(?:[-*+]\s+|#{1,6}\s*)", "", line)
+        line = re.sub(r"[*_`~]", "", line).strip(" \t|>")
+        if line and line.casefold() not in _NOISE:
+            lines.append(line)
+    return lines
+
+
+def yahoo_overall_pick(round_number: int, draft_slot: int, team_count: int) -> int:
+    """Convert Yahoo's round/manager-column label to chronological pick number."""
+    within_round = draft_slot if round_number % 2 else team_count - draft_slot + 1
+    return (round_number - 1) * team_count + within_round
+
+
+def parse_yahoo_draft_board(content: str) -> YahooBoard:
+    """Parse a full Yahoo Draft Board clipboard snapshot.
+
+    Yahoo repeats each manager display name in the header.  The special ``You``
+    line occupies the repeated-name position and is deliberately retained as a
+    stronger ownership signal than saved league settings.
+    """
+    lines = _clean_yahoo_lines(content)
+    record_starts: list[int] = []
+    for i in range(4, len(lines)):
+        if (_PICK_SLOT.fullmatch(lines[i]) and lines[i - 2].upper() in PLAYER_POSITIONS
+                and re.fullmatch(r"[A-Za-z]{2,4}", lines[i - 1])):
+            record_starts.append(i - 4)
+    header_end = min(record_starts) if record_starts else len(lines)
+    header = lines[:header_end]
+
+    managers: dict[int, str] = {}
+    detected_user_slot = None
+    i = 0
+    while i < len(header):
+        name = header[i]
+        if i + 1 < len(header) and header[i + 1].casefold() == name.casefold():
+            managers[len(managers) + 1] = name
+            i += 2
+        elif i + 1 < len(header) and header[i + 1].casefold() == "you":
+            slot = len(managers) + 1
+            managers[slot] = name
+            detected_user_slot = slot
+            i += 2
+        else:
+            # Presentation labels and orphaned image alt text are not managers.
+            i += 1
+    team_count = len(managers) or None
+
+    current_round = current_slot = None
+    picks: list[YahooPick] = []
+    for i, line in enumerate(lines):
+        slot_match = _PICK_SLOT.fullmatch(line)
+        if not slot_match:
+            continue
+        round_number, draft_slot = map(int, slot_match.groups())
+        if i and lines[i - 1].casefold() == "on the clock":
+            current_round, current_slot = round_number, draft_slot
+            continue
+        if (i < 4 or lines[i - 2].upper() not in PLAYER_POSITIONS
+                or not re.fullmatch(r"[A-Za-z]{2,4}", lines[i - 1])):
+            continue  # A bare round.slot is a future pick, not a selection.
+        if not team_count or not 1 <= draft_slot <= team_count:
+            continue
+        raw_context = lines[max(header_end, i - 6):i]
+        context = [value.casefold() for value in raw_context]
+        team_id_match = next((re.search(r"yahoo\s*team\s*id\s*[:=#-]?\s*([\w.-]+)", value, re.I)
+                              for value in reversed(raw_context)
+                              if re.search(r"yahoo\s*team\s*id", value, re.I)), None)
+        picks.append(YahooPick(
+            name=f"{lines[i - 4]} {lines[i - 3]}", position=lines[i - 2].upper(),
+            team=lines[i - 1].upper(), round=round_number, draft_slot=draft_slot,
+            overall_pick=yahoo_overall_pick(round_number, draft_slot, team_count),
+            explicit_user_pick="your team" in context,
+            yahoo_team_id=team_id_match.group(1) if team_id_match else None,
+        ))
+    current_overall = (yahoo_overall_pick(current_round, current_slot, team_count)
+                       if current_round and current_slot and team_count else None)
+    return YahooBoard(team_count, managers, detected_user_slot, tuple(picks),
+                      current_round, current_slot, current_overall)
+
+
+def yahoo_pick_is_mine(pick: YahooPick, board: YahooBoard, *, configured_slot: int,
+                       fantasy_team_name: str = "", yahoo_team_id: str = "") -> bool:
+    """Apply Yahoo clipboard ownership signals in descending precedence."""
+    if board.detected_user_slot is not None:
+        return pick.draft_slot == board.detected_user_slot
+    if pick.explicit_user_pick:
+        return True
+    if yahoo_team_id and pick.yahoo_team_id == yahoo_team_id:
+        return True
+    if fantasy_team_name and board.managers.get(pick.draft_slot, "").casefold() == fantasy_team_name.casefold():
+        return True
+    return pick.draft_slot == configured_slot
+
+
 def stable_player_id(player: str, position: str, team: str) -> str:
     """Create a deterministic, CSV-order-independent player identifier."""
     identity = "|".join((player.strip(), position.strip(), team.strip())).casefold()
