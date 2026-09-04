@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Fantasy Draft Assistant</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div><span class="eyebrow">2026 · STANDARD · 10 TEAMS</span><h1>Fantasy Draft Assistant</h1></div>
+    <label class="import">Import rankings CSV<input id="csvFile" type="file" accept=".csv,text/csv"></label>
+  </header>
+
+  <main>
+    <section class="draft-status" aria-label="Draft status">
+      <div><span>Current overall pick</span><strong id="currentPick">1</strong></div>
+      <div><span>Picks until your turn</span><strong id="picksUntil">2</strong></div>
+      <div><span>Your next pick</span><strong id="nextPick">3</strong></div>
+      <div class="pick-path"><span>Your pick path</span><strong id="pickPath">3 · 18 · 23 · 38 · 43</strong></div>
+    </section>
+
+    <section id="notice" class="notice" role="status"></section>
+
+    <div class="layout">
+      <section class="panel board">
+        <div class="panel-heading"><div><span class="eyebrow">DRAFT BOARD</span><h2>Best available</h2></div><span id="availableCount" class="count"></span></div>
+        <div class="controls">
+          <div id="positionFilters" class="filters" aria-label="Position filters"></div>
+          <label class="search"><span>⌕</span><input id="search" type="search" placeholder="Search player or team" aria-label="Search players"></label>
+        </div>
+        <div class="table-wrap">
+          <table><thead><tr><th>RK</th><th>PLAYER</th><th>POS</th><th>ADP</th><th>ECR</th><th>OUTLOOK</th><th></th></tr></thead><tbody id="playerRows"></tbody></table>
+          <div id="emptyState" class="empty" hidden></div>
+        </div>
+      </section>
+
+      <aside>
+        <section class="panel roster"><div class="panel-heading"><div><span class="eyebrow">TEAM 3</span><h2>My roster</h2></div><span id="rosterCount" class="count">0</span></div><div id="rosterList" class="side-list"></div></section>
+        <section class="panel drafted"><div class="panel-heading"><div><span class="eyebrow">LIVE LOG</span><h2>All drafted players</h2></div><button id="resetDraft" class="text-button">Reset</button></div><div id="draftedList" class="side-list"></div></section>
+      </aside>
+    </div>
+  </main>
+  <footer>Local-only draft board · Data stays in this browser</footer>
+  <script src="draft-engine.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
