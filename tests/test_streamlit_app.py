@@ -271,3 +271,59 @@ class YahooCallbackTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class YahooPasteIntegrationTest(unittest.TestCase):
+    YAHOO = """Opponent Manager
+1
+Ja'Marr Chase
+WR
+Cin
+Bye 10
+You
+2
+Bijan Robinson
+RB
+Atl
+Bye 12
+On the Clock
+3
+"""
+
+    def test_structured_import_uses_parser_and_never_plain_line_matcher(self):
+        players = parse_rankings_csv(streamlit_app.DEFAULT_CSV)
+        settings = dict(streamlit_app.DEFAULT_LEAGUE_SETTINGS)
+        with patch("streamlit_app.draft_parser.parse_yahoo_clipboard",
+                   wraps=streamlit_app.draft_parser.parse_yahoo_clipboard) as parser, \
+             patch("streamlit_app.match_player", side_effect=AssertionError("structured lines used plain matcher")):
+            format_name, rows = streamlit_app.prepare_paste_import(self.YAHOO, 1, players, [], settings)
+        parser.assert_called_once()
+        self.assertEqual(format_name, "yahoo")
+        self.assertEqual([row["Player"] for row in rows], ["Ja'Marr Chase", "Bijan Robinson"])
+        self.assertEqual([row["Match status"] for row in rows], ["MATCHED", "MATCHED"])
+        self.assertNotIn("Opponent Manager", [row["Player"] for row in rows])
+        self.assertNotIn("On the Clock", [row["Player"] for row in rows])
+        self.assertTrue(rows[1]["enabled"])
+        self.assertEqual(rows[1]["Ownership"], "YOUR PICK")
+
+    def test_confirm_and_repeated_full_board_are_incremental(self):
+        app = AppTest.from_file("../streamlit_app.py", default_timeout=10).run()
+        before_cards = [item.value for item in app.markdown if '<div class="player-card"><strong>' in item.value][:5]
+        app.text_area(key="pasted_names").set_value(self.YAHOO).run()
+        app.button(key="confirm_pasted").click().run()
+        log = app.session_state["draft_log"]
+        self.assertEqual([(entry["pick"], entry["player"].player, entry["mine"]) for entry in log],
+                         [(1, "Ja'Marr Chase", False), (2, "Bijan Robinson", True)])
+        self.assertEqual(streamlit_app.current_overall_pick(log), 3)
+        after_cards = [item.value for item in app.markdown if '<div class="player-card"><strong>' in item.value][:5]
+        self.assertTrue(after_cards)
+        self.assertFalse(any("Ja&#x27;Marr Chase" in card or "Bijan Robinson" in card for card in after_cards))
+        app.text_area(key="pasted_names").set_value(self.YAHOO).run()
+        self.assertTrue(app.button(key="confirm_pasted").disabled)
+        self.assertEqual(len(app.session_state["draft_log"]), 2)
+
+    def test_plain_list_fallback_remains_available(self):
+        players = parse_rankings_csv(streamlit_app.DEFAULT_CSV)
+        kind, rows = streamlit_app.prepare_paste_import("Ja'Marr Chase\nBijan Robinson", 1, players, [],
+                                                        dict(streamlit_app.DEFAULT_LEAGUE_SETTINGS))
+        self.assertEqual(kind, "plain")
+        self.assertEqual([row["Player"] for row in rows], ["Ja'Marr Chase", "Bijan Robinson"])

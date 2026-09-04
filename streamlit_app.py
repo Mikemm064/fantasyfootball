@@ -20,6 +20,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 import yahoo_auth
+import draft_parser
 from draft_parser import match_player, parse_pasted_picks
 from draft_utils import (DEFAULT_LEAGUE_SETTINGS, current_overall_pick, draft_timing,
                          export_state, identify_ownership, next_user_pick, pick_context,
@@ -356,6 +357,52 @@ def match_pasted_name(name: str, available: list[Player]) -> tuple[Player | None
     return player, "confirmed" if status == "Ready" else "ambiguous" if "Ambiguous" in status else "unmatched"
 
 
+
+def prepare_paste_import(text: str, starting_pick: int, players: list[Player],
+                         draft_log: list[dict[str, Any]], settings: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:
+    """Detect, parse, match, and reconcile paste text for the UI preview."""
+    yahoo_picks = draft_parser.parse_yahoo_clipboard(
+        text, teams=int(settings["teams"]), my_team_name=str(settings["my_team_name"]),
+        yahoo_team_id=str(settings["yahoo_team_id"]), draft_slot=int(settings["draft_slot"]),
+    )
+    if yahoo_picks:
+        draft_parser.match_players(yahoo_picks, players)
+        result = draft_parser.incremental_import(yahoo_picks, draft_log)
+        conflicts, unchanged, new = set(map(id, result.conflicts)), set(map(id, result.unchanged)), set(map(id, result.new_picks))
+        rows = []
+        for pick in result.picks:
+            player = pick.matched_player
+            status = ("CONFLICT" if id(pick) in conflicts else "ALREADY IMPORTED" if id(pick) in unchanged
+                      else "AMBIGUOUS" if "ambiguous player" in pick.review_reasons
+                      else "UNMATCHED" if not player else "MATCHED")
+            ownership = "REVIEW" if pick.needs_review else "YOUR PICK" if pick.mine else "Opponent"
+            rows.append({"pick": pick.overall_pick, "Overall Pick": pick.overall_pick,
+                         "Round": (pick.overall_pick - 1) // int(settings["teams"]) + 1,
+                         "Yahoo Slot": pick.yahoo_slot, "Player": player.player if player else pick.player_name,
+                         "Position": player.position if player else pick.position,
+                         "NFL Team": player.team if player else pick.nfl_team,
+                         "Fantasy Manager": pick.fantasy_team, "Ownership": ownership,
+                         "Match status": status, "player_obj": player,
+                         "enabled": id(pick) in new and status == "MATCHED" and ownership != "REVIEW"})
+        return "yahoo", rows
+
+    available = [p for p in players if not any(e["player_id"] == p.id for e in draft_log)]
+    drafted_ids = {entry["player_id"] for entry in draft_log}
+    rows, seen = [], set()
+    for parsed in parse_pasted_picks(text, int(starting_pick)):
+        player, confidence, status = match_player(parsed["raw_name"], available)
+        ownership, _ = identify_ownership(pick=parsed["pick"], fantasy_team=parsed["fantasy_team"],
+                                          yahoo_team_id=parsed["yahoo_team_id"], settings=settings)
+        if player and (player.id in seen or player.id in drafted_ids): status = "Duplicate/already drafted"
+        if ownership == "REVIEW": status = "Ownership conflict — REVIEW"
+        if player: seen.add(player.id)
+        rows.append({**parsed, "Overall Pick": parsed["pick"], "Player": player.player if player else parsed["raw_name"],
+                     "Position": player.position if player else parsed["position"],
+                     "NFL Team": player.team if player else parsed["team"], "Fantasy Manager": parsed["fantasy_team"],
+                     "Ownership": ownership, "Confidence": confidence, "Match status": status,
+                     "player_obj": player, "enabled": bool(player and status == "Ready" and ownership != "REVIEW")})
+    return "plain", rows
+
 def _keyboard_listener(focus_search: bool = False) -> None:
     """Progressive enhancement only: draft state remains in Python/button callbacks."""
     components.html(f"""<script>
@@ -617,25 +664,24 @@ def main() -> None:
     with st.expander("Paste Draft Picks / Catch Up"):
         starting = st.number_input("Starting Pick Number", min_value=1, value=current_pick, step=1)
         pasted = st.text_area("Draft-board text", key="pasted_names", placeholder="18. A.J. Brown\nPick 19 - Chase Brown")
-        preview=[]; seen=set()
-        for parsed in parse_pasted_picks(pasted, int(starting)):
-            player, confidence, status = match_player(parsed["raw_name"], available)
-            ownership, signals = identify_ownership(pick=parsed["pick"], fantasy_team=parsed["fantasy_team"],
-                yahoo_team_id=parsed["yahoo_team_id"], settings=settings)
-            if player and (player.id in seen or player.id in drafted_ids): status="Duplicate/already drafted"
-            if ownership == "REVIEW": status="Ownership conflict — REVIEW"
-            if player: seen.add(player.id)
-            preview.append({**parsed, "player_obj":player, "Player":player.player if player else parsed["raw_name"],
-                "Pos":player.position if player else parsed["position"], "NFL Team":player.team if player else parsed["team"],
-                "Fantasy Team":parsed["fantasy_team"], "Ownership":ownership, "Confidence":confidence, "Status":status})
+        paste_format, preview = prepare_paste_import(pasted, int(starting), st.session_state.players,
+                                                     st.session_state.draft_log, settings)
         if preview:
-            st.dataframe([{k:r[k] for k in ("pick","Player","Pos","NFL Team","Fantasy Team","Ownership","Confidence","Status")} for r in preview], hide_index=True, use_container_width=True)
-        valid=[r for r in preview if r["player_obj"] and r["Status"] == "Ready" and r["Ownership"] != "REVIEW"]
+            if paste_format == "yahoo":
+                columns = ("Overall Pick", "Round", "Yahoo Slot", "Player", "Position", "NFL Team",
+                           "Fantasy Manager", "Ownership", "Match status")
+            else:
+                columns = ("Overall Pick", "Player", "Position", "NFL Team", "Fantasy Manager",
+                           "Ownership", "Confidence", "Match status")
+            st.dataframe([{key: row.get(key, "") for key in columns} for row in preview],
+                         hide_index=True, use_container_width=True)
+        valid = [row for row in preview if row["enabled"]]
         if st.button("Confirm Draft Picks", disabled=not valid, key="confirm_pasted"):
-            batch=f"paste-{time.time_ns()}"
-            for row in sorted(valid,key=lambda r:r["pick"]):
-                draft_player(row["player_obj"].id, row["Ownership"] == "YOUR PICK", row["pick"], batch, "paste")
-            st.session_state.pasted_names=""; _reset_quick_search(); st.rerun()
+            batch = f"paste-{time.time_ns()}"
+            for row in sorted(valid, key=lambda item: item["pick"]):
+                draft_player(row["player_obj"].id, row["Ownership"] == "YOUR PICK",
+                             row["pick"], batch, paste_format)
+            _reset_quick_search(); st.rerun()
         if st.button("Undo Last Batch", disabled=not any(str(e.get("batch_id") or "").startswith("paste-") for e in st.session_state.draft_log)):
             batches=[e.get("batch_id") for e in st.session_state.draft_log if str(e.get("batch_id","")).startswith("paste-")]
             latest=batches[-1]; st.session_state.draft_log=[e for e in st.session_state.draft_log if e.get("batch_id") != latest]; st.rerun()
