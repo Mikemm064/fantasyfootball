@@ -92,6 +92,10 @@ def validate_signed_state(
         payload_part, signature_part = state.split(".")
         payload = _urlsafe_decode(payload_part)
         signature = _urlsafe_decode(signature_part)
+        # Reject non-canonical base64 spellings so changing even unused trailing
+        # bits cannot produce a second textual representation of a valid state.
+        if _urlsafe_encode(payload) != payload_part or _urlsafe_encode(signature) != signature_part:
+            return False
         expected = hmac.new(_state_signing_key(credentials), payload, hashlib.sha256).digest()
         if len(signature) != hashlib.sha256().digest_size or not hmac.compare_digest(
             signature, expected

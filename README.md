@@ -7,7 +7,7 @@ A native Streamlit draft board for a 10-team standard-scoring league drafting fr
 1. Install Python 3 and the dependencies: `python -m pip install -r requirements.txt`.
 2. Start the app: `streamlit run streamlit_app.py`.
 
-For Streamlit Community Cloud, select **`streamlit_app.py`** as the app entrypoint. Active draft progress is held in `st.session_state` for the browser session.
+For Streamlit Community Cloud, select **`streamlit_app.py`** as the app entrypoint. Active draft progress is held in `st.session_state`; use the single-file **Export Draft State** JSON download regularly so a browser/session reset is recoverable.
 
 ## 2026 recommendation engine
 
@@ -50,9 +50,21 @@ Escape clears the native search or selection. Shortcuts are disabled while
 typing in other fields, and the regular buttons remain available if keyboard
 enhancement is unavailable.
 
-**Paste Draft Picks** accepts one Yahoo player name per line, previews only
-clear available-player matches, and labels ambiguous or unmatched lines.
-Confirming records all clear matches together; uncertain lines are never guessed.
+**Paste Draft Picks / Catch Up** accepts numbered Yahoo-style lines or plain player
+names assigned from **Starting Pick Number**. It normalizes punctuation and suffixes,
+then uses exact matching before conservative fuzzy matching. Its preview shows pick,
+player, position, NFL/fantasy team, ownership, confidence, and status. Snake pick,
+fantasy team name, and Yahoo team ID independently identify your picks; conflicting
+signals stay in REVIEW and are not imported. Duplicate, drafted, ambiguous, and
+unmatched players are also withheld. A confirmed import can be reversed as one batch.
+
+## Draft-night backup
+
+**Export Draft State** downloads league/team settings, the complete player pool,
+stable IDs, all picks and ownership, manual labels, and recommendation inputs as one
+JSON file. Upload it under **Restore Draft State** and confirm to reproduce the board
+without Yahoo access. The defaults are Party on Pearl Street (league `557989`) and
+Sippin' On Jeanty Juice (team `6`), but all league fields remain editable.
 
 ## Scope
 
