@@ -72,6 +72,144 @@ class Player:
     expert_rankings: dict[str, float] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class YahooPick:
+    """One completed selection extracted from a Yahoo draft-board paste."""
+
+    name: str
+    position: str
+    team: str
+    round: int
+    draft_slot: int
+    overall_pick: int
+    explicit_user_pick: bool = False
+    yahoo_team_id: str | None = None
+
+
+@dataclass(frozen=True)
+class YahooBoard:
+    """Ephemeral metadata and selections from a single clipboard snapshot."""
+
+    team_count: int | None
+    managers: dict[int, str]
+    detected_user_slot: int | None
+    picks: tuple[YahooPick, ...]
+    current_round: int | None = None
+    current_slot: int | None = None
+    current_overall_pick: int | None = None
+
+    @property
+    def current_manager(self) -> str | None:
+        return self.managers.get(self.current_slot) if self.current_slot else None
+
+
+_PICK_SLOT = re.compile(r"^(\d+)\.(\d+)$")
+_URL = re.compile(r"(?:https?://|data:image/)[^\s)>]+", re.I)
+_NOISE = {"svg", "image", "img", "...", "…", "draft board", "yahoo draft board"}
+
+
+def _clean_yahoo_lines(content: str) -> list[str]:
+    """Remove image links/Markdown decoration without damaging player apostrophes."""
+    content = re.sub(r"!\[[^]]*]\([^)]*\)", "\n", content)
+    content = re.sub(r"\[([^]]+)]\([^)]*\)", r"\1", content)
+    content = re.sub(r"<img\b[^>]*>", "\n", content, flags=re.I)
+    lines: list[str] = []
+    for raw in content.splitlines():
+        line = _URL.sub("", raw).strip()
+        line = re.sub(r"^\s{0,3}(?:[-*+]\s+|#{1,6}\s*)", "", line)
+        line = re.sub(r"[*_`~]", "", line).strip(" \t|>")
+        if line and line.casefold() not in _NOISE:
+            lines.append(line)
+    return lines
+
+
+def yahoo_overall_pick(round_number: int, draft_slot: int, team_count: int) -> int:
+    """Convert Yahoo's round/manager-column label to chronological pick number."""
+    within_round = draft_slot if round_number % 2 else team_count - draft_slot + 1
+    return (round_number - 1) * team_count + within_round
+
+
+def parse_yahoo_draft_board(content: str) -> YahooBoard:
+    """Parse a full Yahoo Draft Board clipboard snapshot.
+
+    Yahoo repeats each manager display name in the header.  The special ``You``
+    line occupies the repeated-name position and is deliberately retained as a
+    stronger ownership signal than saved league settings.
+    """
+    lines = _clean_yahoo_lines(content)
+    record_starts: list[int] = []
+    for i in range(4, len(lines)):
+        if (_PICK_SLOT.fullmatch(lines[i]) and lines[i - 2].upper() in PLAYER_POSITIONS
+                and re.fullmatch(r"[A-Za-z]{2,4}", lines[i - 1])):
+            record_starts.append(i - 4)
+    header_end = min(record_starts) if record_starts else len(lines)
+    header = lines[:header_end]
+
+    managers: dict[int, str] = {}
+    detected_user_slot = None
+    i = 0
+    while i < len(header):
+        name = header[i]
+        if i + 1 < len(header) and header[i + 1].casefold() == name.casefold():
+            managers[len(managers) + 1] = name
+            i += 2
+        elif i + 1 < len(header) and header[i + 1].casefold() == "you":
+            slot = len(managers) + 1
+            managers[slot] = name
+            detected_user_slot = slot
+            i += 2
+        else:
+            # Presentation labels and orphaned image alt text are not managers.
+            i += 1
+    team_count = len(managers) or None
+
+    current_round = current_slot = None
+    picks: list[YahooPick] = []
+    for i, line in enumerate(lines):
+        slot_match = _PICK_SLOT.fullmatch(line)
+        if not slot_match:
+            continue
+        round_number, draft_slot = map(int, slot_match.groups())
+        if i and lines[i - 1].casefold() == "on the clock":
+            current_round, current_slot = round_number, draft_slot
+            continue
+        if (i < 4 or lines[i - 2].upper() not in PLAYER_POSITIONS
+                or not re.fullmatch(r"[A-Za-z]{2,4}", lines[i - 1])):
+            continue  # A bare round.slot is a future pick, not a selection.
+        if not team_count or not 1 <= draft_slot <= team_count:
+            continue
+        raw_context = lines[max(header_end, i - 6):i]
+        context = [value.casefold() for value in raw_context]
+        team_id_match = next((re.search(r"yahoo\s*team\s*id\s*[:=#-]?\s*([\w.-]+)", value, re.I)
+                              for value in reversed(raw_context)
+                              if re.search(r"yahoo\s*team\s*id", value, re.I)), None)
+        picks.append(YahooPick(
+            name=f"{lines[i - 4]} {lines[i - 3]}", position=lines[i - 2].upper(),
+            team=lines[i - 1].upper(), round=round_number, draft_slot=draft_slot,
+            overall_pick=yahoo_overall_pick(round_number, draft_slot, team_count),
+            explicit_user_pick="your team" in context,
+            yahoo_team_id=team_id_match.group(1) if team_id_match else None,
+        ))
+    current_overall = (yahoo_overall_pick(current_round, current_slot, team_count)
+                       if current_round and current_slot and team_count else None)
+    return YahooBoard(team_count, managers, detected_user_slot, tuple(picks),
+                      current_round, current_slot, current_overall)
+
+
+def yahoo_pick_is_mine(pick: YahooPick, board: YahooBoard, *, configured_slot: int,
+                       fantasy_team_name: str = "", yahoo_team_id: str = "") -> bool:
+    """Apply Yahoo clipboard ownership signals in descending precedence."""
+    if board.detected_user_slot is not None:
+        return pick.draft_slot == board.detected_user_slot
+    if pick.explicit_user_pick:
+        return True
+    if yahoo_team_id and pick.yahoo_team_id == yahoo_team_id:
+        return True
+    if fantasy_team_name and board.managers.get(pick.draft_slot, "").casefold() == fantasy_team_name.casefold():
+        return True
+    return pick.draft_slot == configured_slot
+
+
 def stable_player_id(player: str, position: str, team: str) -> str:
     """Create a deterministic, CSV-order-independent player identifier."""
     identity = "|".join((player.strip(), position.strip(), team.strip())).casefold()
@@ -170,13 +308,13 @@ def initialize_state() -> None:
         st.session_state.upload_token = None
 
 
-def draft_player(player_id: str, mine: bool) -> None:
+def draft_player(player_id: str, mine: bool, pick: int | None = None) -> None:
     drafted_ids = {entry["player"].id for entry in st.session_state.draft_log}
     player = next((p for p in st.session_state.players if p.id == player_id), None)
     if player and player.id not in drafted_ids:
         st.session_state.draft_log.append({
             "player": player,
-            "pick": len(st.session_state.draft_log) + 1,
+            "pick": pick if pick is not None else len(st.session_state.draft_log) + 1,
             "mine": mine,
         })
 
@@ -390,14 +528,20 @@ def main() -> None:
             else:
                 st.error("No valid players found. Include Player and Position (RB, WR, QB, or TE).")
 
-    current_pick = len(st.session_state.draft_log) + 1
-    future_picks = [pick for pick in snake_picks() if pick >= current_pick]
-    next_pick = next_user_pick(current_pick)
-    metrics = st.columns([1, 1, 1, 2])
+    paste_board: YahooBoard | None = st.session_state.get("yahoo_board")
+    session_teams = paste_board.team_count if paste_board and paste_board.team_count else TEAMS
+    session_slot = (paste_board.detected_user_slot
+                    if paste_board and paste_board.detected_user_slot else MY_SLOT)
+    current_pick = (paste_board.current_overall_pick if paste_board else None)
+    current_pick = current_pick or len(st.session_state.draft_log) + 1
+    future_picks = [pick for pick in snake_picks(session_teams, session_slot) if pick >= current_pick]
+    next_pick = next_user_pick(current_pick, session_teams, session_slot)
+    metrics = st.columns([1, 1, 1, 2, 1.5])
     metrics[0].metric("CURRENT OVERALL PICK", current_pick)
     metrics[1].metric("PICKS UNTIL YOUR TURN", max(0, next_pick - current_pick) if next_pick else "—")
     metrics[2].metric("YOUR NEXT PICK", next_pick or "—")
     metrics[3].metric("YOUR PICK PATH", " · ".join(map(str, future_picks[:5])) or "Draft complete")
+    metrics[4].metric("ON THE CLOCK", paste_board.current_manager or "—" if paste_board else "—")
 
     drafted_ids = {entry["player"].id for entry in st.session_state.draft_log}
     roster = [entry["player"] for entry in st.session_state.draft_log if entry["mine"]]
@@ -434,24 +578,46 @@ def main() -> None:
     _keyboard_listener(st.session_state.pop("quick_refocus", False))
 
     with st.expander("Paste Draft Picks"):
-        pasted = st.text_area("Yahoo player names", key="pasted_names",
-                              placeholder="Paste one player per line")
-        pasted_names = [line.strip() for line in pasted.splitlines() if line.strip()]
-        paste_matches = [(name, *match_pasted_name(name, available)) for name in pasted_names]
-        confirmed = [(name, player) for name, player, status in paste_matches
+        paste_version = st.session_state.get("paste_version", 0)
+        pasted = st.text_area("Yahoo Draft Board", key=f"pasted_names_{paste_version}",
+                              placeholder="Paste the entire Yahoo Draft Board")
+        if st.button("Preview", disabled=not pasted.strip(), key="preview_pasted"):
+            st.session_state.yahoo_preview = parse_yahoo_draft_board(pasted)
+        preview: YahooBoard | None = st.session_state.get("yahoo_preview")
+        if preview and preview.team_count:
+            user_text = (f" · You are Slot {preview.detected_user_slot}"
+                         if preview.detected_user_slot else "")
+            st.info(f"Detected Yahoo board: {preview.team_count} teams{user_text}")
+            if (preview.team_count != TEAMS
+                    or (preview.detected_user_slot and preview.detected_user_slot != MY_SLOT)):
+                st.warning("This pasted board appears to be a mock or different league. "
+                           "Using detected board settings for this import only.")
+            if preview.current_overall_pick:
+                manager = f" · {preview.current_manager}" if preview.current_manager else ""
+                st.caption(f"On the clock: {preview.current_round}.{preview.current_slot}{manager} "
+                           f"(overall pick {preview.current_overall_pick})")
+        preview_picks = list(preview.picks) if preview else []
+        paste_matches = [(pick, *match_pasted_name(pick.name, available)) for pick in preview_picks]
+        confirmed = [(pick, player) for pick, player, status in paste_matches
                      if status == "confirmed" and player is not None]
-        for name, player, status in paste_matches:
+        for pick, player, status in paste_matches:
             if status == "confirmed":
-                st.success(f"{name} → {player.player} ({player.position}, {player.team})")
+                owner = " · YOUR PICK" if yahoo_pick_is_mine(
+                    pick, preview, configured_slot=MY_SLOT) else ""
+                st.success(f"{pick.round}.{pick.draft_slot} {pick.name} → {player.player} "
+                           f"({player.position}, {player.team}){owner}")
             elif status == "ambiguous":
-                st.warning(f"{name} — ambiguous; not selected")
+                st.warning(f"{pick.name} — ambiguous; not selected")
             else:
-                st.error(f"{name} — no available match")
+                st.error(f"{pick.name} — no available match")
         if st.button(f"Mark {len(confirmed)} confirmed drafted", disabled=not confirmed,
                      key="confirm_pasted"):
-            for _, player in confirmed:
-                draft_player(player.id, False)
-            st.session_state.pasted_names = ""
+            for pick, player in sorted(confirmed, key=lambda item: item[0].overall_pick):
+                draft_player(player.id, yahoo_pick_is_mine(
+                    pick, preview, configured_slot=MY_SLOT), pick.overall_pick)
+            st.session_state.yahoo_board = preview
+            st.session_state.pop("yahoo_preview", None)
+            st.session_state.paste_version = paste_version + 1
             st.session_state.quick_version = quick_version + 1
             st.session_state.quick_refocus = True
             st.rerun()

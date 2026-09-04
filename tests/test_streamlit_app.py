@@ -4,7 +4,14 @@ from unittest.mock import Mock, patch
 from streamlit.testing.v1 import AppTest
 
 import streamlit_app
-from streamlit_app import match_pasted_name, parse_rankings_csv, snake_picks, stable_player_id
+from streamlit_app import (
+    match_pasted_name,
+    parse_rankings_csv,
+    parse_yahoo_draft_board,
+    snake_picks,
+    stable_player_id,
+    yahoo_pick_is_mine,
+)
 
 
 SAMPLE = """Player,Position,Team,Overall Rank,ADP,Expert Consensus Rank,Target,Sleeper,Fade,Drafted
@@ -16,6 +23,74 @@ Tight End Four,TE,ARI,4,24.1,2,,,Yes,Yes
 
 EXTENDED = """Player,Position,Team,Overall Rank,ADP,Expert Consensus Rank,Projection,Role Score,Opportunity Score,Risk Score,Expert Count,Expert Weighted Rank,Recommendation Score,Recommendation Label,Notes
 New Player,WR,SEA,20,31,22,180,75,80,20,2,19,88,Target,Deep role
+"""
+
+YAHOO_BOARD = """![manager](https://s.yimg.com/manager.svg)
+**Adam**
+Adam
+Ray
+Ray
+Randall
+Randall
+okDen
+okDen
+Michael
+You
+WeaponXI
+WeaponXI
+Monje
+Monje
+Gridiron
+Gridiron
+Blitz
+Blitz
+Sunday
+Sunday
+Pearl
+Pearl
+Champion
+Champion
+Waivers
+Waivers
+Dynasty
+Dynasty
+
+Jahmyr
+Gibbs
+RB
+Det
+1.1
+
+Puka
+Nacua
+WR
+LAR
+1.5
+
+De'Von
+Achane
+RB
+Mia
+2.5
+
+Breece
+Hall
+RB
+NYJ
+3.5
+
+Tee
+Higgins
+WR
+Cin
+3.6
+
+On the Clock
+svg
+3.7
+
+3.8
+3.9
 """
 
 
@@ -70,6 +145,45 @@ Same Name,QB,BUF,,3
         match, status = match_pasted_name("nobody remotely similar", players)
         self.assertIsNone(match)
         self.assertIn(status, {"ambiguous", "unmatched"})
+
+    def test_complete_yahoo_board_header_ownership_and_clock(self):
+        board = parse_yahoo_draft_board(YAHOO_BOARD)
+        self.assertEqual(board.team_count, 14)
+        self.assertEqual(board.managers[1], "Adam")
+        self.assertEqual(board.managers[5], "Michael")
+        self.assertEqual(board.detected_user_slot, 5)
+
+        by_name = {pick.name: pick for pick in board.picks}
+        for name in ("Puka Nacua", "De'Von Achane", "Breece Hall"):
+            self.assertTrue(yahoo_pick_is_mine(
+                by_name[name], board, configured_slot=3,
+                fantasy_team_name="Sippin' On Jeanty Juice",
+            ))
+        self.assertFalse(yahoo_pick_is_mine(
+            by_name["Tee Higgins"], board, configured_slot=3))
+        self.assertEqual((board.current_round, board.current_slot), (3, 7))
+        self.assertEqual(board.current_overall_pick, 35)
+        self.assertEqual(board.current_manager, "Monje")
+        self.assertEqual(len(board.picks), 5)  # Bare 3.8/3.9 slots are not picks.
+
+    def test_yahoo_preview_confirm_updates_session_and_only_offers_new_picks(self):
+        app = AppTest.from_file("../streamlit_app.py", default_timeout=10).run()
+        app.text_area(key="pasted_names_0").set_value(YAHOO_BOARD).run()
+        app.button(key="preview_pasted").click().run()
+        self.assertFalse(app.exception)
+        self.assertEqual(app.button(key="confirm_pasted").label, "Mark 3 confirmed drafted")
+
+        app.button(key="confirm_pasted").click().run()
+        self.assertFalse(app.exception)
+        imported = {entry["player"].player: entry for entry in app.session_state["draft_log"]}
+        self.assertTrue(imported["Puka Nacua"]["mine"])
+        self.assertTrue(imported["De'Von Achane"]["mine"])
+        self.assertFalse(imported["Jahmyr Gibbs"]["mine"])
+        self.assertEqual(app.session_state["yahoo_board"].current_overall_pick, 35)
+
+        app.text_area(key="pasted_names_1").set_value(YAHOO_BOARD).run()
+        app.button(key="preview_pasted").click().run()
+        self.assertEqual(app.button(key="confirm_pasted").label, "Mark 0 confirmed drafted")
 
     def test_quick_draft_selection_records_and_clears(self):
         app = AppTest.from_file("../streamlit_app.py", default_timeout=10).run()
