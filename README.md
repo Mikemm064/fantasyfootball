@@ -1,20 +1,19 @@
 # Fantasy Draft Assistant
 
-A reliable, local-only browser draft board for a 10-team standard-scoring Yahoo league drafting from slot 3.
+A native Streamlit draft board for a 10-team standard-scoring league drafting from slot 3.
 
-## Start on Windows
+## Run locally
 
-1. Install [Python 3](https://www.python.org/downloads/) if it is not already installed (select **Add Python to PATH** during installation).
-2. Double-click **`run.bat`**. Your browser opens automatically.
-3. Keep the command window open during the draft. Close it or press Ctrl+C when finished.
+1. Install Python 3 and the dependencies: `python -m pip install -r requirements.txt`.
+2. Start the app: `streamlit run streamlit_app.py`.
 
-No packages, account, internet connection, or build step are required. Draft progress is saved in that browser's local storage.
+For Streamlit Community Cloud, select **`streamlit_app.py`** as the app entrypoint. Active draft progress is held in `st.session_state` for the browser session.
 
 ## Import rankings
 
 Select **Import rankings CSV**. Supported columns are `Player`, `Position`, `Team`, `Overall Rank`, `ADP`, `Expert Consensus Rank`, `Target`, `Sleeper`, `Fade`, and `Drafted`. `Player` and `Position` are required; position must be RB, WR, QB, or TE. Boolean fields accept Yes, Y, True, 1, or X. See `sample-rankings.csv`.
 
-Importing replaces the player board and resets prior draft progress. Use **Drafted** for another team's pick or **+ Mine** for your selection. The undo arrow in the draft log corrects a mistake.
+Importing replaces the player board and resets prior draft progress. Use **Drafted** for another team's pick or **+ Mine** for your selection. **Undo** reverses the most recent draft action.
 
 ## Scope
 
