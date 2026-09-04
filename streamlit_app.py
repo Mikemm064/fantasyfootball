@@ -10,10 +10,13 @@ import csv
 import hashlib
 import html
 import io
+import re
 from dataclasses import dataclass, field
+from difflib import SequenceMatcher
 from typing import Any
 
 import streamlit as st
+import streamlit.components.v1 as components
 
 import yahoo_auth
 from draft_utils import draft_timing, next_user_pick, snake_picks
@@ -25,21 +28,21 @@ MY_SLOT = 3
 POSITIONS = ("ALL", "RB", "WR", "QB", "TE")
 PLAYER_POSITIONS = set(POSITIONS[1:])
 
-DEFAULT_CSV = """Player,Position,Team,Overall Rank,ADP,Expert Consensus Rank,Target,Sleeper,Fade,Drafted
-Ja'Marr Chase,WR,CIN,1,1.4,1,Yes,,,No
-Bijan Robinson,RB,ATL,2,2.1,2,Yes,,,No
-Jahmyr Gibbs,RB,DET,3,3.2,3,Yes,,,No
-Justin Jefferson,WR,MIN,4,4.8,4,,,,No
-CeeDee Lamb,WR,DAL,5,5.3,5,,,,No
-Puka Nacua,WR,LAR,6,7.1,6,Yes,,,No
-Saquon Barkley,RB,PHI,7,6.8,7,,,,No
-Amon-Ra St. Brown,WR,DET,8,8.2,8,,,,No
-Josh Allen,QB,BUF,9,18.0,10,,,,No
-Brock Bowers,TE,LV,10,13.4,9,Yes,,,No
-Lamar Jackson,QB,BAL,11,21.0,12,,,,No
-Trey McBride,TE,ARI,12,20.1,11,,Yes,,No
-Malik Nabers,WR,NYG,13,12.4,13,,Yes,,No
-De'Von Achane,RB,MIA,14,15.7,14,,,Yes,No
+DEFAULT_CSV = """Player,Position,Team,Draft Key,Overall Rank,ADP,Expert Consensus Rank,Target,Sleeper,Fade,Drafted
+Ja'Marr Chase,WR,CIN,chase,1,1.4,1,Yes,,,No
+Bijan Robinson,RB,ATL,,2,2.1,2,Yes,,,No
+Jahmyr Gibbs,RB,DET,,3,3.2,3,Yes,,,No
+Justin Jefferson,WR,MIN,,4,4.8,4,,,,No
+CeeDee Lamb,WR,DAL,,5,5.3,5,,,,No
+Puka Nacua,WR,LAR,,6,7.1,6,Yes,,,No
+Saquon Barkley,RB,PHI,,7,6.8,7,,,,No
+Amon-Ra St. Brown,WR,DET,,8,8.2,8,,,,No
+Josh Allen,QB,BUF,,9,18.0,10,,,,No
+Brock Bowers,TE,LV,,10,13.4,9,Yes,,,No
+Lamar Jackson,QB,BAL,,11,21.0,12,,,,No
+Trey McBride,TE,ARI,,12,20.1,11,,Yes,,No
+Malik Nabers,WR,NYG,,13,12.4,13,,Yes,,No
+De'Von Achane,RB,MIA,,14,15.7,14,,,Yes,No
 """
 
 
@@ -55,6 +58,7 @@ class Player:
     target: bool
     sleeper: bool
     fade: bool
+    draft_key: str = ""
     drafted: bool = False
     projection: float | None = None
     role_score: float | None = None
@@ -72,6 +76,18 @@ def stable_player_id(player: str, position: str, team: str) -> str:
     """Create a deterministic, CSV-order-independent player identifier."""
     identity = "|".join((player.strip(), position.strip(), team.strip())).casefold()
     return f"p_{hashlib.sha256(identity.encode('utf-8')).hexdigest()[:16]}"
+
+
+def _draft_key(name: str, team: str, used: set[str], supplied: str = "") -> str:
+    """Return a short, unique, human-typeable key for an imported player."""
+    base = supplied.strip() or "-".join(re.findall(r"[a-z0-9]+", name.casefold())[-2:])
+    base = base or team.casefold() or "player"
+    candidate, suffix = base, 2
+    while candidate.casefold() in used:
+        candidate = f"{base}-{suffix}"
+        suffix += 1
+    used.add(candidate.casefold())
+    return candidate
 
 
 def _number(value: str | None) -> float | None:
@@ -101,6 +117,7 @@ def parse_rankings_csv(content: str) -> list[Player]:
 
     players: list[tuple[int, Player]] = []
     seen: set[str] = set()
+    used_keys: set[str] = set()
     for source_order, row in enumerate(reader):
         name = value(row, "player", "playername", "name").strip()
         position = value(row, "position", "pos").strip().upper()
@@ -113,6 +130,7 @@ def parse_rankings_csv(content: str) -> list[Player]:
         seen.add(player_id)
         players.append((source_order, Player(
             id=player_id, player=name, position=position, team=team,
+            draft_key=_draft_key(name, team, used_keys, value(row, "draftkey", "key")),
             rank=_number(value(row, "overallrank", "rank", "overall")),
             adp=_number(value(row, "adp")),
             ecr=_number(value(row, "expertconsensusrank", "ecr")),
@@ -166,6 +184,79 @@ def draft_player(player_id: str, mine: bool) -> None:
 def undo_last() -> None:
     if st.session_state.draft_log:
         st.session_state.draft_log.pop()
+
+
+def player_search_score(player: Player, query: str) -> tuple[int, float, float]:
+    """Rank partial name/team/key matches, with deterministic rank tie-breaking."""
+    query = query.strip().casefold()
+    name = player.player.casefold()
+    last = name.split()[-1]
+    team = player.team.casefold()
+    key = player.draft_key.casefold()
+    if not query:
+        quality = 1
+    elif query in {name, last, key}:
+        quality = 100
+    elif name.startswith(query) or last.startswith(query) or key.startswith(query):
+        quality = 90
+    elif query in name:
+        quality = 80
+    elif query in team or query in key:
+        quality = 70
+    else:
+        quality = 0
+    similarity = max(SequenceMatcher(None, query, name).ratio(),
+                     SequenceMatcher(None, query, last).ratio()) if query else 0
+    return quality, similarity, -(player.rank or 9999)
+
+
+def match_pasted_name(name: str, available: list[Player]) -> tuple[Player | None, str]:
+    """Conservatively fuzzy-match one pasted Yahoo name."""
+    query = name.strip()
+    if not query:
+        return None, "unmatched"
+    scored = sorted(((player_search_score(p, query), p) for p in available),
+                    key=lambda item: item[0], reverse=True)
+    if not scored:
+        return None, "unmatched"
+    best_score, best = scored[0]
+    # Exact/partial matches are safe; fuzzy matches require a strong, clear lead.
+    if best_score[0] >= 80:
+        same_quality = [p for score, p in scored if score[:2] == best_score[:2]]
+        return (best, "confirmed") if len(same_quality) == 1 else (None, "ambiguous")
+    second_similarity = scored[1][0][1] if len(scored) > 1 else 0
+    if best_score[1] >= .82 and best_score[1] - second_similarity >= .12:
+        return best, "confirmed"
+    return None, "ambiguous" if best_score[1] >= .6 else "unmatched"
+
+
+def _keyboard_listener(focus_search: bool = False) -> None:
+    """Progressive enhancement only: draft state remains in Python/button callbacks."""
+    components.html(f"""<script>
+    (() => {{
+      const w = window.parent, d = w.document;
+      const editable = e => e && (e.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(e.tagName));
+      const findButton = label => [...d.querySelectorAll('button')].find(b => b.innerText.trim() === label);
+      const search = () => d.querySelector('[aria-label="Quick Draft Search"]');
+      if (!w.__quickDraftKeys) {{
+        w.__quickDraftKeys = e => {{
+          const inQuick = e.target === search();
+          if (editable(e.target) && !inQuick) return;
+          if ((e.key === '/' && !editable(e.target)) || (e.ctrlKey && e.key.toLowerCase() === 'k')) {{
+            e.preventDefault(); search()?.focus(); return;
+          }}
+          if (inQuick && e.key === 'Enter') {{ setTimeout(() => search()?.blur(), 25); return; }}
+          if (inQuick && e.key === 'Escape') return;
+          if (editable(e.target)) return;
+          const key = e.key.toLowerCase();
+          const label = key === 'd' ? 'Draft selected' : key === 'm' ? 'Mine selected' : key === 'u' ? '↶ Undo' : '';
+          if (label) {{ const b = findButton(label); if (b && !b.disabled) {{ e.preventDefault(); b.click(); }} }}
+        }};
+        w.addEventListener('keydown', w.__quickDraftKeys);
+      }}
+      if ({str(focus_search).lower()}) setTimeout(() => search()?.focus(), 50);
+    }})();
+    </script>""", height=0)
 
 
 def _format_number(value: float | None) -> str:
@@ -311,6 +402,60 @@ def main() -> None:
     drafted_ids = {entry["player"].id for entry in st.session_state.draft_log}
     roster = [entry["player"] for entry in st.session_state.draft_log if entry["mine"]]
     available = [p for p in st.session_state.players if p.id not in drafted_ids]
+
+    st.subheader("Quick Draft Entry")
+    st.caption("Type a player, last name, NFL team, or Draft Key. Enter selects; then D drafts or M adds to your roster.")
+    quick_version = st.session_state.get("quick_version", 0)
+    selected_id = st.selectbox(
+        "Quick Draft Search",
+        options=[p.id for p in available],
+        index=None,
+        key=f"quick_search_{quick_version}",
+        placeholder="Search available players…  ( / or Ctrl+K )",
+        format_func=lambda player_id: next(
+            f"{p.player} — {p.position} · {p.team} · {p.draft_key}"
+            for p in available if p.id == player_id
+        ),
+    )
+    selected = next((p for p in available if p.id == selected_id), None)
+    quick_drafted, quick_mine = st.columns(2)
+    if quick_drafted.button("Draft selected", disabled=selected is None,
+                            use_container_width=True, key="quick_drafted"):
+        draft_player(selected.id, False)
+        st.session_state.quick_version = quick_version + 1
+        st.session_state.quick_refocus = True
+        st.rerun()
+    if quick_mine.button("Mine selected", disabled=selected is None, type="primary",
+                         use_container_width=True, key="quick_mine"):
+        draft_player(selected.id, True)
+        st.session_state.quick_version = quick_version + 1
+        st.session_state.quick_refocus = True
+        st.rerun()
+    _keyboard_listener(st.session_state.pop("quick_refocus", False))
+
+    with st.expander("Paste Draft Picks"):
+        pasted = st.text_area("Yahoo player names", key="pasted_names",
+                              placeholder="Paste one player per line")
+        pasted_names = [line.strip() for line in pasted.splitlines() if line.strip()]
+        paste_matches = [(name, *match_pasted_name(name, available)) for name in pasted_names]
+        confirmed = [(name, player) for name, player, status in paste_matches
+                     if status == "confirmed" and player is not None]
+        for name, player, status in paste_matches:
+            if status == "confirmed":
+                st.success(f"{name} → {player.player} ({player.position}, {player.team})")
+            elif status == "ambiguous":
+                st.warning(f"{name} — ambiguous; not selected")
+            else:
+                st.error(f"{name} — no available match")
+        if st.button(f"Mark {len(confirmed)} confirmed drafted", disabled=not confirmed,
+                     key="confirm_pasted"):
+            for _, player in confirmed:
+                draft_player(player.id, False)
+            st.session_state.pasted_names = ""
+            st.session_state.quick_version = quick_version + 1
+            st.session_state.quick_refocus = True
+            st.rerun()
+
     board, sidebar = st.columns([2.25, 1], gap="large")
     with board:
         st.subheader("Top 5 Recommendations")

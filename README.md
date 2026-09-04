@@ -29,7 +29,7 @@ scraping, Yahoo draft polling, or automated selections.
 ## Import rankings
 
 Select **Import rankings CSV**. In addition to the original columns, imports may
-include `Projection`, `Role Score`, `Opportunity Score`, `Risk Score`, `Expert
+include `Draft Key`, `Projection`, `Role Score`, `Opportunity Score`, `Risk Score`, `Expert
 Count`, `Expert Weighted Rank`, `Recommendation Score`, `Recommendation Label`,
 and `Notes`. `Player` and `Position` are required; position must be RB, WR, QB,
 or TE. Boolean fields accept Yes, Y, True, 1, or X. Missing optional fields use
@@ -38,6 +38,21 @@ neutral model defaults, so old files remain valid. `Target`, `Sleeper`, and
 score. See `sample-rankings.csv`.
 
 Importing replaces the player board and resets prior draft progress. Use **Drafted** for another team's pick or **+ Mine** for your selection. **Undo** reverses the most recent draft action.
+
+## Quick Draft Entry
+
+At the top of the live controls, **Quick Draft Search** searches only available
+players by partial name, last name, NFL team, or Draft Key. Draft Keys are
+optional in CSV imports; a readable unique key is generated when omitted.
+Select a result with Enter, then use **D** to mark it drafted or **M** to mark it
+as yours. **/** or **Ctrl+K** focuses search, **U** undoes the last pick, and
+Escape clears the native search or selection. Shortcuts are disabled while
+typing in other fields, and the regular buttons remain available if keyboard
+enhancement is unavailable.
+
+**Paste Draft Picks** accepts one Yahoo player name per line, previews only
+clear available-player matches, and labels ambiguous or unmatched lines.
+Confirming records all clear matches together; uncertain lines are never guessed.
 
 ## Scope
 

@@ -4,7 +4,7 @@ from unittest.mock import Mock, patch
 from streamlit.testing.v1 import AppTest
 
 import streamlit_app
-from streamlit_app import parse_rankings_csv, snake_picks, stable_player_id
+from streamlit_app import match_pasted_name, parse_rankings_csv, snake_picks, stable_player_id
 
 
 SAMPLE = """Player,Position,Team,Overall Rank,ADP,Expert Consensus Rank,Target,Sleeper,Fade,Drafted
@@ -53,6 +53,32 @@ class DraftEngineTest(unittest.TestCase):
         self.assertEqual((new.projection, new.role_score, new.expert_count), (180, 75, 2))
         self.assertEqual(new.imported_recommendation_label, "Target")
         self.assertEqual(new.notes, "Deep role")
+
+    def test_draft_keys_are_imported_or_generated_uniquely(self):
+        csv_text = """Player,Position,Team,Draft Key,Rank
+Same Name,RB,ATL,custom,1
+Same Name,WR,CIN,,2
+Same Name,QB,BUF,,3
+"""
+        players = parse_rankings_csv(csv_text)
+        self.assertEqual([p.draft_key for p in players], ["custom", "same-name", "same-name-2"])
+
+    def test_paste_matching_is_conservative(self):
+        players = parse_rankings_csv(SAMPLE)
+        match, status = match_pasted_name("Receiver Two", players)
+        self.assertEqual((match.player, status), ("Receiver Two", "confirmed"))
+        match, status = match_pasted_name("nobody remotely similar", players)
+        self.assertIsNone(match)
+        self.assertIn(status, {"ambiguous", "unmatched"})
+
+    def test_quick_draft_selection_records_and_clears(self):
+        app = AppTest.from_file("../streamlit_app.py", default_timeout=10).run()
+        player_id = stable_player_id("Ja'Marr Chase", "WR", "CIN")
+        app.selectbox(key="quick_search_0").set_value(player_id).run()
+        app.button(key="quick_drafted").click().run()
+        self.assertTrue(any(entry["player"].id == player_id
+                            for entry in app.session_state["draft_log"]))
+        self.assertIsNone(app.selectbox(key="quick_search_1").value)
 
     def test_app_filters_drafts_mine_and_undo(self):
         app = AppTest.from_file("../streamlit_app.py", default_timeout=10).run()
