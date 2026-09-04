@@ -65,3 +65,28 @@ C\n3\nA. St. Brown\nWR\nDet\nBye 6"""
 
 if __name__ == "__main__":
     unittest.main()
+
+class IncomingDuplicateReconciliationTest(unittest.TestCase):
+    def _pick(self, number, name, position="WR", team="PHI"):
+        from draft_parser import DraftPick
+        return DraftPick(number, name, position, team)
+
+    def test_exact_duplicate_incoming_is_accepted_once(self):
+        result = incremental_import([self._pick(18, "A.J. Brown"), self._pick(18, "a.j. brown")], [])
+        self.assertEqual(len(result.new_picks), 1)
+        self.assertEqual(len(result.unchanged), 1)
+        self.assertEqual(result.conflicts, [])
+
+    def test_conflicting_duplicate_incoming_rejects_pick_number(self):
+        result = incremental_import([self._pick(18, "A.J. Brown"),
+                                     self._pick(18, "Garrett Wilson", team="NYJ")], [])
+        self.assertEqual(result.new_picks, [])
+        self.assertEqual({pick.player_name for pick in result.conflicts}, {"A.J. Brown", "Garrett Wilson"})
+
+    def test_existing_identity_is_unchanged_or_conflict(self):
+        identical = incremental_import([self._pick(18, "A.J. Brown")],
+                                       [{"pick": 18, "player": "a.j. brown", "position": "WR", "team": "PHI"}])
+        self.assertEqual((identical.new_picks, len(identical.unchanged)), ([], 1))
+        conflict = incremental_import([self._pick(18, "Garrett Wilson", team="NYJ")],
+                                      [{"pick": 18, "player": "A.J. Brown", "position": "WR", "team": "PHI"}])
+        self.assertEqual((conflict.new_picks, len(conflict.conflicts)), ([], 1))
