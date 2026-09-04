@@ -14,6 +14,10 @@ Quarterback Three,QB,BUF,3,18.4,4,,,,No
 Tight End Four,TE,ARI,4,24.1,2,,,Yes,Yes
 """
 
+EXTENDED = """Player,Position,Team,Overall Rank,ADP,Expert Consensus Rank,Projection,Role Score,Opportunity Score,Risk Score,Expert Count,Expert Weighted Rank,Recommendation Score,Recommendation Label,Notes
+New Player,WR,SEA,20,31,22,180,75,80,20,2,19,88,Target,Deep role
+"""
+
 
 class AttrDict(dict):
     __getattr__ = dict.__getitem__
@@ -42,30 +46,52 @@ class DraftEngineTest(unittest.TestCase):
         self.assertEqual(players[0].id, stable_player_id("Runner One", "RB", "ATL"))
         self.assertEqual(players[0].id, parse_rankings_csv(SAMPLE)[0].id)
 
+    def test_csv_extended_columns_and_backwards_compatibility(self):
+        old = parse_rankings_csv("Player,Position,Rank\nOld,RB,1\n")[0]
+        self.assertIsNone(old.role_score)
+        new = parse_rankings_csv(EXTENDED)[0]
+        self.assertEqual((new.projection, new.role_score, new.expert_count), (180, 75, 2))
+        self.assertEqual(new.imported_recommendation_label, "Target")
+        self.assertEqual(new.notes, "Deep role")
+
     def test_app_filters_drafts_mine_and_undo(self):
-        app = AppTest.from_file("streamlit_app.py", default_timeout=10).run()
+        app = AppTest.from_file("../streamlit_app.py", default_timeout=10).run()
         self.assertFalse(app.exception)
-        self.assertEqual(len(app.button(key="draft_" + stable_player_id("Ja'Marr Chase", "WR", "CIN"))), 1)
+        self.assertEqual(app.button(key="draft_" + stable_player_id("Ja'Marr Chase", "WR", "CIN")).label,
+                         "Drafted")
 
         app.segmented_control(key="position_filter").set_value("QB").run()
-        self.assertEqual(len(app.button(key="draft_" + stable_player_id("Josh Allen", "QB", "BUF"))), 1)
-        self.assertEqual(len(app.button(key="draft_" + stable_player_id("Bijan Robinson", "RB", "ATL"))), 0)
+        self.assertEqual(app.button(key="draft_" + stable_player_id("Josh Allen", "QB", "BUF")).label,
+                         "Drafted")
+        self.assertFalse(any(button.key == "draft_" + stable_player_id("Bijan Robinson", "RB", "ATL")
+                             for button in app.button))
 
         josh_id = stable_player_id("Josh Allen", "QB", "BUF")
         app.button(key="draft_" + josh_id).click().run()
-        self.assertEqual(len(app.button(key="draft_" + josh_id)), 0)
+        self.assertFalse(any(button.key == "draft_" + josh_id for button in app.button))
 
         app.segmented_control(key="position_filter").set_value("TE").run()
         brock_id = stable_player_id("Brock Bowers", "TE", "LV")
         app.button(key="mine_" + brock_id).click().run()
-        self.assertEqual(len(app.button(key="mine_" + brock_id)), 0)
+        self.assertFalse(any(button.key == "mine_" + brock_id for button in app.button))
         self.assertTrue(any(entry["player"].id == brock_id and entry["mine"]
                             for entry in app.session_state["draft_log"]))
 
-        app.button(label="↶ Undo").click().run()
-        self.assertEqual(len(app.button(key="mine_" + brock_id)), 1)
+        next(button for button in app.button if button.label == "↶ Undo").click().run()
+        self.assertEqual(app.button(key="mine_" + brock_id).label, "+ Mine")
         self.assertFalse(any(entry["player"].id == brock_id
                              for entry in app.session_state["draft_log"]))
+
+    def test_top_five_updates_after_manual_draft(self):
+        app = AppTest.from_file("../streamlit_app.py", default_timeout=10).run()
+        before = [entry.value for entry in app.markdown
+                  if '<div class="player-card"><strong>' in entry.value][:5]
+        top_name = "Trey McBride"
+        app.button(key="draft_" + stable_player_id(top_name, "TE", "ARI")).click().run()
+        after = [entry.value for entry in app.markdown
+                 if '<div class="player-card"><strong>' in entry.value][:5]
+        self.assertNotEqual(before, after)
+        self.assertFalse(any(f">1. {top_name} —" in card for card in after))
 
 
 class YahooCallbackTest(unittest.TestCase):

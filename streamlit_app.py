@@ -10,12 +10,14 @@ import csv
 import hashlib
 import html
 import io
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import streamlit as st
 
 import yahoo_auth
+from draft_utils import draft_timing, next_user_pick, snake_picks
+from recommendation_engine import rank_recommendations
 
 
 TEAMS = 10
@@ -54,15 +56,16 @@ class Player:
     sleeper: bool
     fade: bool
     drafted: bool = False
-
-
-def snake_picks(teams: int = TEAMS, slot: int = MY_SLOT, rounds: int = 20) -> list[int]:
-    """Return overall selections for a slot in a snake draft."""
-    return [
-        (round_number - 1) * teams
-        + (slot if round_number % 2 else teams - slot + 1)
-        for round_number in range(1, rounds + 1)
-    ]
+    projection: float | None = None
+    role_score: float | None = None
+    opportunity_score: float | None = None
+    risk_score: float | None = None
+    expert_count: int | None = None
+    expert_weighted_rank: float | None = None
+    imported_recommendation_score: float | None = None
+    imported_recommendation_label: str = ""
+    notes: str = ""
+    expert_rankings: dict[str, float] = field(default_factory=dict)
 
 
 def stable_player_id(player: str, position: str, team: str) -> str:
@@ -117,6 +120,19 @@ def parse_rankings_csv(content: str) -> list[Player]:
             sleeper=_truthy(value(row, "sleeper")),
             fade=_truthy(value(row, "fade")),
             drafted=_truthy(value(row, "drafted")),
+            projection=_number(value(row, "projection")),
+            role_score=_number(value(row, "rolescore")),
+            opportunity_score=_number(value(row, "opportunityscore")),
+            risk_score=_number(value(row, "riskscore")),
+            expert_count=int(_number(value(row, "expertcount")) or 0) or None,
+            expert_weighted_rank=_number(value(row, "expertweightedrank")),
+            imported_recommendation_score=_number(value(row, "recommendationscore")),
+            imported_recommendation_label=value(row, "recommendationlabel").strip(),
+            notes=value(row, "notes").strip(),
+            expert_rankings={name[len("expertrank"):].strip(" :_-"): number
+                             for normalized, name in headers.items()
+                             if normalized.startswith("expertrank")
+                             and (number := _number(row.get(name))) is not None},
         )))
     return [item[1] for item in sorted(players, key=lambda item: (item[1].rank or 9999, item[0]))]
 
@@ -285,21 +301,62 @@ def main() -> None:
 
     current_pick = len(st.session_state.draft_log) + 1
     future_picks = [pick for pick in snake_picks() if pick >= current_pick]
-    next_pick = future_picks[0] if future_picks else None
+    next_pick = next_user_pick(current_pick)
     metrics = st.columns([1, 1, 1, 2])
     metrics[0].metric("CURRENT OVERALL PICK", current_pick)
     metrics[1].metric("PICKS UNTIL YOUR TURN", max(0, next_pick - current_pick) if next_pick else "—")
     metrics[2].metric("YOUR NEXT PICK", next_pick or "—")
     metrics[3].metric("YOUR PICK PATH", " · ".join(map(str, future_picks[:5])) or "Draft complete")
 
+    drafted_ids = {entry["player"].id for entry in st.session_state.draft_log}
+    roster = [entry["player"] for entry in st.session_state.draft_log if entry["mine"]]
+    available = [p for p in st.session_state.players if p.id not in drafted_ids]
     board, sidebar = st.columns([2.25, 1], gap="large")
     with board:
+        st.subheader("Top 5 Recommendations")
+        recommendations = rank_recommendations(
+            st.session_state.players, drafted_ids, roster, current_pick
+        )[:5]
+        if not recommendations:
+            st.info("No available players to recommend.")
+        for recommendation_rank, (player, result) in enumerate(recommendations, 1):
+            action, likely_return, survival = draft_timing(
+                current_pick=current_pick, next_pick=next_pick, adp=player.adp,
+                rank=player.rank, position=player.position, model_label=result.model_label,
+            )
+            manual = next((label for enabled, label in (
+                (player.target, "Target"), (player.sleeper, "Sleeper"), (player.fade, "Fade")
+            ) if enabled), None)
+            labels = f"Model: {result.model_label}"
+            if manual:
+                labels += f" · Manual: {manual}"
+            value_basis = result.weighted_rank or player.ecr or player.rank
+            value = (player.adp - value_basis) if player.adp and value_basis else None
+            value_text = f"{value:+.0f} value vs ADP" if value is not None else "Value unavailable"
+            safe = html.escape(player.player)
+            explanation = result.explanation
+            if likely_return:
+                explanation += " Strong value may still remain at the next selection."
+            st.markdown(
+                f'<div class="player-card"><strong>{recommendation_rank}. {safe} — '
+                f'{player.position} · {html.escape(player.team)} — {result.final_score}/100</strong><br>'
+                f'<span class="tag {result.model_label.casefold()}">{html.escape(labels)}</span> '
+                f'<span class="tag">{action}</span><br><span class="muted">ADP '
+                f'{_format_number(player.adp)} · ECR {_format_number(player.ecr)} · {value_text} · '
+                f'{survival}</span><br><span class="muted">{html.escape(explanation)}</span></div>',
+                unsafe_allow_html=True,
+            )
+            with st.expander(f"Why {player.player}?", expanded=False):
+                st.write({"Expert Score": round(result.expert_score),
+                          "Consensus Score": round(result.consensus_score),
+                          "ADP Value Score": round(result.adp_value_score),
+                          "Situation Score": round(result.situation_score),
+                          "Roster Fit Score": round(result.roster_fit_score)})
+
         st.subheader("Best available")
         filters, search = st.columns([1.2, 2])
         position = filters.segmented_control("Position", POSITIONS, default="ALL", key="position_filter")
         query = search.text_input("Player search", placeholder="Search player or team").strip().casefold()
-        drafted_ids = {entry["player"].id for entry in st.session_state.draft_log}
-        available = [p for p in st.session_state.players if p.id not in drafted_ids]
         shown = [p for p in available if (position == "ALL" or p.position == position)
                  and (not query or query in f"{p.player} {p.team}".casefold())]
         st.caption(f"{len(available)} available")
@@ -329,10 +386,10 @@ def main() -> None:
                 st.rerun()
 
     with sidebar:
-        roster = [entry for entry in st.session_state.draft_log if entry["mine"]]
-        st.subheader(f"My roster ({len(roster)})")
-        if roster:
-            for entry in roster:
+        roster_entries = [entry for entry in st.session_state.draft_log if entry["mine"]]
+        st.subheader(f"My roster ({len(roster_entries)})")
+        if roster_entries:
+            for entry in roster_entries:
                 player = entry["player"]
                 st.markdown(f"**{player.position} · {html.escape(player.player)}**  \n"
                             f"<span class='muted'>{html.escape(player.team)} · Pick {entry['pick']}</span>",

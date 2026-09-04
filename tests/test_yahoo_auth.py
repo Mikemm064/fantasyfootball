@@ -1,4 +1,5 @@
 import unittest
+import time
 from unittest.mock import Mock, patch
 from urllib.parse import parse_qs, urlparse
 
@@ -97,7 +98,7 @@ class YahooAuthTest(unittest.TestCase):
         session = {"yahoo_token": {
             "access_token": "private-access",
             "refresh_token": "private-refresh",
-            "expires_at": 9999,
+            "expires_at": time.time() + 9999,
         }}
         self.assertTrue(yahoo_auth.verify_fantasy_access(CREDS, session))
         self.assertEqual(get.call_args.args[0], yahoo_auth.FANTASY_TEST_ENDPOINT)
