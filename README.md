@@ -17,4 +17,17 @@ Importing replaces the player board and resets prior draft progress. Use **Draft
 
 ## Scope
 
-Milestone 1 intentionally contains no Yahoo authentication, live synchronization, AI, or recommendation scoring. Those are planned for Milestone 2 after the local workflow is proven reliable.
+The current milestone adds Yahoo authentication and a read-only Fantasy Football access check. Live synchronization, AI, and recommendation scoring remain out of scope; the draft workflow stays manual.
+
+## Yahoo Fantasy authentication
+
+Yahoo authentication uses the OAuth 2.0 Authorization Code flow and is optional; the manual draft board continues to work without it. Create a Yahoo developer application with the callback URL that exactly matches the deployed Streamlit app URL, then add these values to local or Community Cloud Streamlit Secrets:
+
+```toml
+[yahoo]
+client_id = "your-yahoo-client-id"
+client_secret = "your-yahoo-client-secret"
+redirect_uri = "https://your-app.streamlit.app/"
+```
+
+For local development, use the exact local callback URL registered with Yahoo (for example, `http://localhost:8501/`). Never commit `.streamlit/secrets.toml`; it is ignored by this repository. Tokens remain in the active Streamlit session. The connection check performs one read-only Fantasy Sports API request and does not change leagues, rosters, transactions, or picks.
