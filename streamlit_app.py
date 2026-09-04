@@ -15,6 +15,8 @@ from typing import Any
 
 import streamlit as st
 
+import yahoo_auth
+
 
 TEAMS = 10
 MY_SLOT = 3
@@ -179,6 +181,81 @@ def _inject_styles() -> None:
     """, unsafe_allow_html=True)
 
 
+def _query_value(name: str) -> str | None:
+    """Read one callback parameter across supported Streamlit query APIs."""
+    value = st.query_params.get(name)
+    if isinstance(value, list):
+        return str(value[0]) if value else None
+    return str(value) if value is not None else None
+
+
+def render_yahoo_auth() -> None:
+    """Render and process Yahoo OAuth without exposing token data to the client."""
+    try:
+        credentials = yahoo_auth.credentials_from_secrets(st.secrets)
+    except yahoo_auth.YahooAuthError:
+        st.write("Yahoo not connected")
+        st.caption("Configure Yahoo OAuth credentials in Streamlit Secrets to connect.")
+        return
+
+    code = _query_value("code")
+    returned_state = _query_value("state")
+    oauth_error = _query_value("error")
+    if oauth_error:
+        st.session_state.pop("yahoo_oauth_state", None)
+        st.error("Yahoo authentication was not completed. Please try again.")
+    elif code:
+        expected_state = st.session_state.pop("yahoo_oauth_state", None)
+        if not yahoo_auth.states_match(expected_state, returned_state):
+            st.session_state.pop("yahoo_token", None)
+            st.session_state.pop("yahoo_verified", None)
+            st.error("Yahoo authentication could not be verified. Please try again.")
+        else:
+            try:
+                st.session_state.yahoo_token = yahoo_auth.exchange_code(credentials, code)
+            except yahoo_auth.YahooAuthError as exc:
+                st.session_state.pop("yahoo_token", None)
+                st.session_state.pop("yahoo_verified", None)
+                st.error(str(exc))
+            else:
+                # Authorization codes are single-use; remove one as soon as exchange succeeds.
+                st.query_params.clear()
+                try:
+                    st.session_state.yahoo_verified = yahoo_auth.verify_fantasy_access(
+                        credentials, st.session_state
+                    )
+                except yahoo_auth.YahooAuthError as exc:
+                    st.session_state.yahoo_verified = False
+                    st.error(str(exc))
+                else:
+                    st.rerun()
+
+    if "yahoo_token" in st.session_state:
+        try:
+            yahoo_auth.ensure_fresh_token(credentials, st.session_state)
+        except yahoo_auth.YahooAuthError as exc:
+            st.session_state.pop("yahoo_token", None)
+            st.session_state.pop("yahoo_verified", None)
+            st.error(str(exc))
+
+    if "yahoo_token" in st.session_state:
+        st.write("🟢 Yahoo Connected")
+        if st.session_state.get("yahoo_verified"):
+            st.success("Yahoo Fantasy connection verified.")
+        if st.button("Disconnect Yahoo"):
+            for key in ("yahoo_token", "yahoo_verified", "yahoo_oauth_state"):
+                st.session_state.pop(key, None)
+            st.rerun()
+    else:
+        st.write("Yahoo not connected")
+        if "yahoo_oauth_state" not in st.session_state:
+            st.session_state.yahoo_oauth_state = yahoo_auth.new_state()
+        st.link_button(
+            "Connect Yahoo",
+            yahoo_auth.authorization_url(credentials, st.session_state.yahoo_oauth_state),
+        )
+
+
 def main() -> None:
     st.set_page_config(page_title="Fantasy Draft Assistant", page_icon="🏈", layout="wide")
     _inject_styles()
@@ -187,6 +264,9 @@ def main() -> None:
     st.markdown('<div class="hero"><span class="eyebrow">2026 · STANDARD · 10 TEAMS</span>'
                 '<h1>Fantasy Draft Assistant</h1><span>Manual draft board · Team 3</span></div>',
                 unsafe_allow_html=True)
+
+    render_yahoo_auth()
+    st.divider()
 
     uploaded = st.file_uploader("Import rankings CSV", type=["csv"],
                                 help="Importing replaces the board and resets draft progress.")
