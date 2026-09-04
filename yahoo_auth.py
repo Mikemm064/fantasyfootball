@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 import base64
+import binascii
+import hashlib
+import hmac
+import json
 import secrets
 import time
 from dataclasses import dataclass
@@ -19,6 +23,7 @@ FANTASY_TEST_ENDPOINT = (
 )
 REQUEST_TIMEOUT = 15
 EXPIRY_SKEW_SECONDS = 60
+STATE_SIGNING_CONTEXT = b"fantasy-draft-assistant-yahoo-state-v1"
 
 
 class YahooAuthError(Exception):
@@ -48,9 +53,62 @@ def credentials_from_secrets(streamlit_secrets: Mapping[str, Any]) -> YahooCrede
     return values
 
 
-def new_state() -> str:
-    """Return a cryptographically random, URL-safe CSRF token."""
-    return secrets.token_urlsafe(32)
+def _state_signing_key(credentials: YahooCredentials) -> bytes:
+    """Derive a purpose-specific state key without exposing the client secret."""
+    return hmac.new(
+        credentials.client_secret.encode(), STATE_SIGNING_CONTEXT, hashlib.sha256
+    ).digest()
+
+
+def _urlsafe_encode(value: bytes) -> str:
+    return base64.urlsafe_b64encode(value).rstrip(b"=").decode("ascii")
+
+
+def _urlsafe_decode(value: str) -> bytes:
+    if not value or "=" in value:
+        raise ValueError("invalid base64")
+    return base64.b64decode(
+        value + "=" * (-len(value) % 4), altchars=b"-_", validate=True
+    )
+
+
+def new_signed_state(credentials: YahooCredentials) -> str:
+    """Create a self-contained, authenticated OAuth state value."""
+    payload = json.dumps(
+        {"nonce": secrets.token_urlsafe(32), "iat": int(time.time())},
+        separators=(",", ":"), sort_keys=True,
+    ).encode()
+    signature = hmac.new(_state_signing_key(credentials), payload, hashlib.sha256).digest()
+    return f"{_urlsafe_encode(payload)}.{_urlsafe_encode(signature)}"
+
+
+def validate_signed_state(
+    credentials: YahooCredentials, state: str | None, max_age_seconds: int = 600
+) -> bool:
+    """Validate state authenticity and age without relying on browser session data."""
+    if not isinstance(state, str) or max_age_seconds < 0:
+        return False
+    try:
+        payload_part, signature_part = state.split(".")
+        payload = _urlsafe_decode(payload_part)
+        signature = _urlsafe_decode(signature_part)
+        expected = hmac.new(_state_signing_key(credentials), payload, hashlib.sha256).digest()
+        if len(signature) != hashlib.sha256().digest_size or not hmac.compare_digest(
+            signature, expected
+        ):
+            return False
+        decoded = json.loads(payload.decode())
+        if set(decoded) != {"nonce", "iat"}:
+            return False
+        nonce, issued_at = decoded["nonce"], decoded["iat"]
+        if not isinstance(nonce, str) or len(nonce) < 32:
+            return False
+        if not isinstance(issued_at, int) or isinstance(issued_at, bool):
+            return False
+        age = int(time.time()) - issued_at
+        return 0 <= age <= max_age_seconds
+    except (ValueError, TypeError, UnicodeDecodeError, json.JSONDecodeError, binascii.Error):
+        return False
 
 
 def authorization_url(credentials: YahooCredentials, state: str) -> str:
@@ -82,6 +140,18 @@ def _token_request(credentials: YahooCredentials, data: dict[str, str]) -> dict[
         )
         response.raise_for_status()
         payload = response.json()
+    except requests.HTTPError as exc:
+        response = exc.response
+        status = response.status_code if response is not None else None
+        category = f"HTTP {status}" if status in (401, 403) else "request_rejected"
+        if response is not None:
+            try:
+                error = response.json().get("error")
+            except (ValueError, AttributeError):
+                error = None
+            if error in {"invalid_grant", "invalid_client"}:
+                category = error
+        raise YahooAuthError(f"Yahoo token request failed: {category}.") from exc
     except (requests.RequestException, ValueError) as exc:
         raise YahooAuthError("Yahoo authentication could not be completed. Please try again.") from exc
     if not isinstance(payload, dict) or not payload.get("access_token"):
@@ -155,7 +225,3 @@ def verify_fantasy_access(credentials: YahooCredentials, session: MutableMapping
     except requests.RequestException as exc:
         raise YahooAuthError("Yahoo connected, but Fantasy Football access could not be verified.") from exc
     return True
-
-
-def states_match(expected: str | None, returned: str | None) -> bool:
-    return bool(expected and returned) and secrets.compare_digest(expected, returned)
