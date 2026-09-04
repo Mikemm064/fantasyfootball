@@ -9,15 +9,40 @@ A native Streamlit draft board for a 10-team standard-scoring league drafting fr
 
 For Streamlit Community Cloud, select **`streamlit_app.py`** as the app entrypoint. Active draft progress is held in `st.session_state` for the browser session.
 
+## 2026 recommendation engine
+
+The board now scores every undrafted player from 0–100 using five configurable
+weights in `recommendation_engine.py`: expert history (35%), broad consensus
+(25%), ADP value (15%), role/opportunity (15%), and roster construction (10%).
+Expert opinions retain their names, overall accuracy weights, and optional
+position-specific weights. Target and Fade labels require two corroborating
+expert signals; mixed or sparse evidence stays Neutral. Sleeper additionally
+requires a meaningful discount outside the obvious early rounds.
+
+The **Top 5 Recommendations** refreshes after every Drafted, + Mine, Undo, import,
+or reset action. It shows model and manual labels separately, component scores,
+ADP/ECR value, and an explainable snake-draft TAKE NOW / WAIT / FAIR VALUE /
+FADE AT THIS PRICE decision. QB recommendations are replacement-value adjusted
+for this 10-team, one-QB league. This feature is deterministic and uses no AI,
+scraping, Yahoo draft polling, or automated selections.
+
 ## Import rankings
 
-Select **Import rankings CSV**. Supported columns are `Player`, `Position`, `Team`, `Overall Rank`, `ADP`, `Expert Consensus Rank`, `Target`, `Sleeper`, `Fade`, and `Drafted`. `Player` and `Position` are required; position must be RB, WR, QB, or TE. Boolean fields accept Yes, Y, True, 1, or X. See `sample-rankings.csv`.
+Select **Import rankings CSV**. In addition to the original columns, imports may
+include `Projection`, `Role Score`, `Opportunity Score`, `Risk Score`, `Expert
+Count`, `Expert Weighted Rank`, `Recommendation Score`, `Recommendation Label`,
+and `Notes`. `Player` and `Position` are required; position must be RB, WR, QB,
+or TE. Boolean fields accept Yes, Y, True, 1, or X. Missing optional fields use
+neutral model defaults, so old files remain valid. `Target`, `Sleeper`, and
+`Fade` are manual overrides shown alongside—never substituted into—the model
+score. See `sample-rankings.csv`.
 
 Importing replaces the player board and resets prior draft progress. Use **Drafted** for another team's pick or **+ Mine** for your selection. **Undo** reverses the most recent draft action.
 
 ## Scope
 
-The current milestone adds Yahoo authentication and a read-only Fantasy Football access check. Live synchronization, AI, and recommendation scoring remain out of scope; the draft workflow stays manual.
+Yahoo authentication remains an optional read-only access check while approval
+is pending. Draft synchronization and selections remain manual.
 
 ## Yahoo Fantasy authentication
 

@@ -1,5 +1,5 @@
-Player,Position,Team,Overall Rank,ADP,Expert Consensus Rank,Target,Sleeper,Fade,Drafted
-Example Running Back,RB,ATL,1,2.5,1,Yes,,,No
-Example Wide Receiver,WR,CIN,2,3.2,3,,Yes,,No
-Example Quarterback,QB,BUF,3,18.4,4,,,No,No
-Example Tight End,TE,ARI,4,24.1,2,,,Yes,No
+Player,Position,Team,Overall Rank,ADP,Expert Consensus Rank,Target,Sleeper,Fade,Drafted,Projection,Role Score,Opportunity Score,Risk Score,Expert Count,Expert Weighted Rank,Recommendation Score,Recommendation Label,Notes
+Example Running Back,RB,ATL,1,2.5,1,Yes,,,No,220,85,90,20,2,1.5,,,Manual Target is separate from model
+Example Wide Receiver,WR,CIN,2,13.2,3,,Yes,,No,205,75,80,30,2,5,,,Example value input
+Example Quarterback,QB,BUF,3,18.4,4,,,,No,310,90,90,15,1,4,,,One expert cannot create Target
+Example Tight End,TE,ARI,4,24.1,2,,,Yes,No,180,70,75,25,2,8,,,Manual Fade is separate from model
