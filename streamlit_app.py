@@ -201,15 +201,19 @@ def render_yahoo_auth() -> None:
     code = _query_value("code")
     returned_state = _query_value("state")
     oauth_error = _query_value("error")
+    if any(value is not None for value in (code, returned_state, oauth_error)):
+        # Callback values, especially single-use codes, must not survive a refresh.
+        st.query_params.clear()
     if oauth_error:
-        st.session_state.pop("yahoo_oauth_state", None)
         st.error("Yahoo authentication was not completed. Please try again.")
     elif code:
-        expected_state = st.session_state.pop("yahoo_oauth_state", None)
-        if not yahoo_auth.states_match(expected_state, returned_state):
+        if not yahoo_auth.validate_signed_state(credentials, returned_state):
             st.session_state.pop("yahoo_token", None)
             st.session_state.pop("yahoo_verified", None)
-            st.error("Yahoo authentication could not be verified. Please try again.")
+            st.error(
+                "Yahoo authentication could not be verified. The callback state was "
+                "invalid or expired; please try again."
+            )
         else:
             try:
                 st.session_state.yahoo_token = yahoo_auth.exchange_code(credentials, code)
@@ -218,8 +222,6 @@ def render_yahoo_auth() -> None:
                 st.session_state.pop("yahoo_verified", None)
                 st.error(str(exc))
             else:
-                # Authorization codes are single-use; remove one as soon as exchange succeeds.
-                st.query_params.clear()
                 try:
                     st.session_state.yahoo_verified = yahoo_auth.verify_fantasy_access(
                         credentials, st.session_state
@@ -243,16 +245,14 @@ def render_yahoo_auth() -> None:
         if st.session_state.get("yahoo_verified"):
             st.success("Yahoo Fantasy connection verified.")
         if st.button("Disconnect Yahoo"):
-            for key in ("yahoo_token", "yahoo_verified", "yahoo_oauth_state"):
+            for key in ("yahoo_token", "yahoo_verified"):
                 st.session_state.pop(key, None)
             st.rerun()
     else:
         st.write("Yahoo not connected")
-        if "yahoo_oauth_state" not in st.session_state:
-            st.session_state.yahoo_oauth_state = yahoo_auth.new_state()
         st.link_button(
             "Connect Yahoo",
-            yahoo_auth.authorization_url(credentials, st.session_state.yahoo_oauth_state),
+            yahoo_auth.authorization_url(credentials, yahoo_auth.new_signed_state(credentials)),
         )
 
 
